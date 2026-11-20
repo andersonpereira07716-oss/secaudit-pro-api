@@ -381,3 +381,65 @@ class handler(BaseHTTPRequestHandler):
 
         status_code, response_body = run_audit(payload)
         self._send_json(status_code, response_body)
+
+
+def app(environ, start_response):
+    method = (environ.get('REQUEST_METHOD') or 'GET').upper()
+    path = environ.get('PATH_INFO') or '/api/check-web'
+    if method == 'OPTIONS':
+        start_response('204 No Content', [
+            ('Access-Control-Allow-Origin', '*'),
+            ('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'),
+            ('Access-Control-Allow-Headers', 'Content-Type, Authorization'),
+        ])
+        return [b'']
+    if method == 'GET':
+        body = json.dumps({
+            'service': 'SecAudit PRO API',
+            'status': 'online',
+            'version': '2.1',
+            'endpoint': path,
+        }, ensure_ascii=False).encode('utf-8')
+        start_response('200 OK', [
+            ('Content-Type', 'application/json; charset=utf-8'),
+            ('Access-Control-Allow-Origin', '*'),
+            ('Content-Length', str(len(body))),
+        ])
+        return [body]
+    if method == 'POST':
+        try:
+            length = int(environ.get('CONTENT_LENGTH') or '0')
+        except ValueError:
+            length = 0
+        raw_body = environ['wsgi.input'].read(length) if length > 0 else b'{}'
+        try:
+            payload = json.loads(raw_body.decode('utf-8') or '{}')
+        except Exception:
+            body = json.dumps({'error': 'JSON invalido no corpo da requisicao.'}, ensure_ascii=False).encode('utf-8')
+            start_response('400 Bad Request', [
+                ('Content-Type', 'application/json; charset=utf-8'),
+                ('Access-Control-Allow-Origin', '*'),
+                ('Content-Length', str(len(body))),
+            ])
+            return [body]
+        status_code, response_body = run_audit(payload)
+        status_map = {
+            200: '200 OK',
+            400: '400 Bad Request',
+            403: '403 Forbidden',
+            502: '502 Bad Gateway',
+        }
+        body = json.dumps(response_body, ensure_ascii=False).encode('utf-8')
+        start_response(status_map.get(status_code, f'{status_code} OK'), [
+            ('Content-Type', 'application/json; charset=utf-8'),
+            ('Access-Control-Allow-Origin', '*'),
+            ('Content-Length', str(len(body))),
+        ])
+        return [body]
+    body = json.dumps({'error': 'Metodo nao suportado.'}, ensure_ascii=False).encode('utf-8')
+    start_response('405 Method Not Allowed', [
+        ('Content-Type', 'application/json; charset=utf-8'),
+        ('Access-Control-Allow-Origin', '*'),
+        ('Content-Length', str(len(body))),
+    ])
+    return [body]
