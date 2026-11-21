@@ -313,6 +313,43 @@ def _fetch_hdrs(url: str) -> tuple[int, dict[str, str], list[str]]:
             cookies = e.headers.get_all("Set-Cookie") or []
         return e.code, hdrs, cookies
 
+
+def _detect_hosting_context(host: str, hdrs: dict, dns_info: dict) -> dict:
+    h = (host or "").lower()
+    srv = (hdrs.get("server") or "").lower()
+    via = (hdrs.get("via") or "").lower()
+    x_ver = (hdrs.get("x-vercel-id") or "").strip()
+    cf_ray = (hdrs.get("cf-ray") or "").strip()
+    ns_join = " ".join(dns_info.get("ns") or []).lower()
+
+    provider = "custom/unknown"
+    is_static_host = False
+    can_set_custom_headers = True
+    notes = []
+
+    if h.endswith(".surge.sh") or "surge" in srv or "surge.sh" in ns_join:
+        provider = "surge.sh"
+        is_static_host = True
+        can_set_custom_headers = False
+        notes.append("Hospedagem estática Surge.sh: headers HTTP customizados e CAA nativo do host não são configuráveis diretamente no provedor.")
+    elif x_ver or "vercel" in srv:
+        provider = "vercel"
+    elif cf_ray or "cloudflare" in srv or "cloudflare" in ns_join:
+        provider = "cloudflare"
+
+    if not is_static_host and ("github.io" in h or "pages.dev" in h or "netlify.app" in h):
+        provider = h.split(".")[-2] + "." + h.split(".")[-1] if len(h.split(".")) >= 2 else h
+        is_static_host = True
+        can_set_custom_headers = False
+        notes.append("Hospedagem estática/CDN gerenciada: alguns headers ou registros dependem da configuração da plataforma.")
+
+    return {
+        "provider": provider,
+        "is_static_host": is_static_host,
+        "can_set_custom_headers": can_set_custom_headers,
+        "notes": notes,
+    }
+
 def _subscore(items: list[dict]) -> int:
     return max(0, min(100, 100 - sum(SEVERITY_PENALTY.get(i.get("severity", "MEDIO"), 6) for i in items)))
 
@@ -322,9 +359,8 @@ def run_audit(payload: dict) -> tuple[int, dict]:
     client = (payload.get("client_name") or "Cliente Nao Informado").strip() or "Cliente Nao Informado"
     try:
         url, host, port = _normalize_target(payload.get("target") or payload.get("url") or "")
-    except ValueError as e:
-        return 400, {"error": str(e)}
-
+    except ValueError as err:
+        return 400, {"error": str(err)}
     tls_f, web_f, dns_f, passed = [], [], [], []
     tls_info = _tls(host, port if port != 80 else 443)
     if tls_info.get("tls_valid"):
@@ -341,24 +377,25 @@ def run_audit(payload: dict) -> tuple[int, dict]:
                 passed.append(f"Validade TLS saudavel ({d} dias restantes)")
     else:
         tls_f.append({"category": "TLS", "title": "Falha na validacao TLS/SSL do alvo", "severity": "CRITICO", "action": "Verifique certificados, dominio e TLS no servidor."})
-
     redir = _https_redirect(host)
     if redir:
         passed.append("Redirecionamento HTTP para HTTPS ativo")
     else:
         tls_f.append({"category": "TLS", "title": "HTTP nao redireciona obrigatoriamente para HTTPS", "severity": "ALTO", "action": "Configure redirecionamento 301 de HTTP para HTTPS."})
-
     try:
         status, hdrs, cookies = _fetch_hdrs(url)
-    except Exception as e:
-        return 502, {"error": f"Falha ao conectar no alvo {url}: {e}", "target": url, "host": host}
-
+    except Exception as err:
+        return 502, {"error": f"Falha ao conectar no alvo {url}: {err}", "target": url, "host": host}
+    dns_info = _dns_email(host)
+    hosting_ctx = _detect_hosting_context(host, hdrs, dns_info)
+    static_host = hosting_ctx.get("is_static_host", False)
     for hname, sev, act in SECURITY_HEADERS:
         if hdrs.get(hname.lower()):
             passed.append(f"Cabecalho {hname} presente")
         else:
-            web_f.append({"category": "HEADERS", "title": f"Cabecalho de seguranca ausente: {hname}", "severity": sev, "action": act})
-
+            eff_sev = "BAIXO" if (static_host and sev in ("ALTO", "MEDIO")) else sev
+            eff_act = f"{act} (Host estatico {hosting_ctx.get('provider')}: avalie proxy/CDN como Cloudflare.)" if static_host else act
+            web_f.append({"category": "HEADERS", "title": f"Cabecalho de seguranca ausente: {hname}", "severity": eff_sev, "action": eff_act})
     hsts_raw = hdrs.get("strict-transport-security", "")
     hsts_meta = {"present": bool(hsts_raw), "max_age": None, "include_subdomains": False, "preload": False}
     if hsts_raw:
@@ -369,58 +406,64 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             age = int(ma.group(1))
             hsts_meta["max_age"] = age
             if age < 15552000:
-                web_f.append({"category": "HEADERS", "title": f"HSTS com max-age curto ({age}s)", "severity": "BAIXO", "action": "Use max-age >= 15552000 (180 dias)."})
+                web_f.append({"category": "HEADERS", "title": f"HSTS com max-age curto ({age}s)", "severity": "BAIXO", "action": "Use max-age >= 31536000 (1 ano) ou >= 15552000 (180 dias)."})
             else:
                 passed.append("HSTS configurado com max-age robusto")
-
     csp_raw = hdrs.get("content-security-policy", "")
-    csp_meta = {"present": bool(csp_raw), "directives_count": 0, "has_unsafe_inline_or_eval": False, "has_wildcard_script_or_default": False, "has_object_src_none": False, "has_frame_ancestors": False}
+    csp_meta = {"present": bool(csp_raw), "directives_count": 0, "has_unsafe_inline_or_eval": False, "has_wildcard_script_or_default": False, "has_object_src_none": False, "has_frame_ancestors": False, "has_base_uri": False, "has_form_action": False}
     if csp_raw:
         ds = _parse_csp(csp_raw)
         csp_meta["directives_count"] = len(ds)
-        if "'unsafe-inline'" in csp_raw.lower() or "'unsafe-eval'" in csp_raw.lower():
+        csp_meta["has_base_uri"] = "base-uri" in ds
+        csp_meta["has_form_action"] = "form-action" in ds
+        stoks = [t.lower() for t in (ds.get("script-src") or ds.get("default-src") or [])]
+        ytoks = [t.lower() for t in (ds.get("style-src") or [])]
+        has_eval = "'unsafe-eval'" in csp_raw.lower()
+        has_s_inl = "'unsafe-inline'" in stoks
+        has_y_inl = "'unsafe-inline'" in ytoks
+        if has_eval or has_s_inl:
             csp_meta["has_unsafe_inline_or_eval"] = True
-            web_f.append({"category": "HEADERS", "title": "Content-Security-Policy permite unsafe-inline ou unsafe-eval", "severity": "BAIXO", "action": "Prefira nonces ou hashes em vez de unsafe-inline/unsafe-eval."})
+            web_f.append({"category": "HEADERS", "title": "CSP permite unsafe-eval ou unsafe-inline em scripts", "severity": "ALTO" if has_eval else "MEDIO", "action": "Remova unsafe-eval e use nonce/hash em script-src."})
+        elif has_y_inl:
+            csp_meta["has_unsafe_inline_or_eval"] = True
+            web_f.append({"category": "HEADERS", "title": "CSP permite unsafe-inline apenas em estilos", "severity": "BAIXO", "action": "Restrinja estilos inline ou use nonce/hash em style-src."})
         else:
             passed.append("CSP sem diretivas unsafe-inline/unsafe-eval")
-        stoks = ds.get("script-src") or ds.get("default-src") or []
         if "*" in stoks or "data:" in stoks:
             csp_meta["has_wildcard_script_or_default"] = True
             web_f.append({"category": "HEADERS", "title": "CSP com fonte ampla (* ou data:) em script-src/default-src", "severity": "MEDIO", "action": "Restrinja origens de scripts a dominios confiaveis."})
-        otoks = ds.get("object-src") or []
+        otoks = [t.lower() for t in (ds.get("object-src") or [])]
         if "'none'" in otoks:
             csp_meta["has_object_src_none"] = True
             passed.append("CSP bloqueia plugins via object-src 'none'")
-        elif "object-src" not in ds and "'none'" not in (ds.get("default-src") or []):
+        elif "object-src" not in ds and "'none'" not in [t.lower() for t in (ds.get("default-src") or [])]:
             web_f.append({"category": "HEADERS", "title": "CSP sem object-src 'none' explicito", "severity": "BAIXO", "action": "Adicione object-src 'none' na CSP."})
         if "frame-ancestors" in ds:
             csp_meta["has_frame_ancestors"] = True
             passed.append("CSP define frame-ancestors contra clickjacking")
-
     for h_iso, label in (("cross-origin-opener-policy", "Cross-Origin-Opener-Policy"), ("cross-origin-resource-policy", "Cross-Origin-Resource-Policy")):
         if (hdrs.get(h_iso) or "").strip():
             passed.append(f"Cabecalho {label} presente ({hdrs.get(h_iso).strip()})")
-
     srv = hdrs.get("server", "")
     if re.search(r"[/]\s*\d+(\.\d+)+", srv):
         web_f.append({"category": "HEADERS", "title": f"Versao explicita do servidor exposta ({srv})", "severity": "BAIXO", "action": "Oculte versoes exatas no cabecalho Server."})
-    xpb = hdrs.get("x-powered-by", "")
-    if xpb:
-        web_f.append({"category": "HEADERS", "title": f"Tecnologia interna exposta em X-Powered-By ({xpb})", "severity": "BAIXO", "action": "Remova X-Powered-By na resposta HTTP."})
+    if hdrs.get("x-powered-by", ""):
+        web_f.append({"category": "HEADERS", "title": f"Tecnologia interna exposta em X-Powered-By ({hdrs.get('x-powered-by', '')})", "severity": "BAIXO", "action": "Remova X-Powered-By na resposta HTTP."})
     if (hdrs.get("access-control-allow-origin") or "").strip() == "*":
         web_f.append({"category": "HEADERS", "title": "CORS permissivo irrestrito (Access-Control-Allow-Origin: *)", "severity": "MEDIO", "action": "Restrinja Access-Control-Allow-Origin as origens confiaveis."})
-
     for rc in cookies:
         cl = rc.lower()
-        cn = rc.split("=", 1)[0].strip() or "cookie"
+        cn = (rc.split("=", 1)[0] or "cookie").strip()
         if "httponly" not in cl:
-            web_f.append({"category": "COOKIES", "title": f"Cookie sem flag HttpOnly: {cn}", "severity": "MEDIO", "action": f"Adicione HttpOnly ao cookie {cn}."})
+            web_f.append({"category": "COOKIES", "title": f"Cookie sem flag HttpOnly: {cn}", "severity": "MEDIO", "action": f"Adicione HttpOnly ao cookie {cn} se nao precisar ser lido por JS."})
         if url.startswith("https://") and "secure" not in cl:
             web_f.append({"category": "COOKIES", "title": f"Cookie sem flag Secure em HTTPS: {cn}", "severity": "MEDIO", "action": f"Adicione Secure ao cookie {cn}."})
         if "samesite=" not in cl:
             web_f.append({"category": "COOKIES", "title": f"Cookie sem atributo SameSite: {cn}", "severity": "BAIXO", "action": f"Defina SameSite=Lax ou Strict no cookie {cn}."})
-
-    dns_info = _dns_email(host)
+        if cn.startswith("__Host-") and ("secure" not in cl or "path=/" not in cl.replace(" ", "") or "domain=" in cl):
+            web_f.append({"category": "COOKIES", "title": f"Cookie com prefixo __Host- fora do padrao: {cn}", "severity": "MEDIO", "action": "Cookies __Host- exigem Secure, Path=/ e sem Domain."})
+        if cn.startswith("__Secure-") and "secure" not in cl:
+            web_f.append({"category": "COOKIES", "title": f"Cookie com prefixo __Secure- sem Secure: {cn}", "severity": "MEDIO", "action": "Cookies __Secure- exigem Secure."})
     if dns_info.get("has_spf"):
         lk = dns_info.get("spf_lookups", 0)
         passed.append(f"Registro SPF configurado ({lk} DNS lookup(s) estimados)")
@@ -432,7 +475,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             dns_f.append({"category": "DNS", "title": "Politica SPF sem fechamento restritivo (~all ou -all)", "severity": "BAIXO", "action": "Finalize o SPF com ~all ou -all."})
     else:
         dns_f.append({"category": "DNS", "title": f"Registro SPF ausente em {dns_info.get('domain')}", "severity": "MEDIO", "action": "Publique registro TXT v=spf1."})
-
     if dns_info.get("has_dmarc"):
         pol = dns_info.get("dmarc_policy") or "desconhecida"
         if pol == "none":
@@ -441,16 +483,16 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             passed.append(f"DMARC ativo com politica restritiva (p={pol})")
     else:
         dns_f.append({"category": "DNS", "title": f"Registro DMARC ausente em _dmarc.{dns_info.get('domain')}", "severity": "MEDIO", "action": "Configure registro TXT em _dmarc."})
-
     if dns_info.get("has_dkim"):
         passed.append(f"DKIM detectado ({ ', '.join(dns_info.get('dkim_selectors') or []) })")
     if dns_info.get("has_caa"):
         passed.append("Registro CAA configurado para emissao de certificados")
+    elif not static_host:
+        dns_f.append({"category": "DNS", "title": f"Registro CAA ausente em {dns_info.get('domain')}", "severity": "BAIXO", "action": "Publique registro CAA autorizando as CAs emissoras de certificados."})
     if dns_info.get("dnssec_enabled"):
         passed.append("DNSSEC autenticado no dominio")
     else:
         dns_f.append({"category": "DNS", "title": f"DNSSEC nao autenticado em {dns_info.get('domain')}", "severity": "BAIXO", "action": "Habilite DNSSEC no DNS/registrador."})
-
     mta = dns_info.get("mta_sts") or {}
     if mta.get("has_dns_record") and mta.get("policy_accessible"):
         passed.append(f"MTA-STS ativo (modo: {mta.get('mode') or 'detectado'})")
@@ -458,17 +500,19 @@ def run_audit(payload: dict) -> tuple[int, dict]:
         dns_f.append({"category": "DNS", "title": "Registro _mta-sts presente, mas politica /.well-known/mta-sts.txt inacessivel", "severity": "BAIXO", "action": "Publique mta-sts.txt em https://mta-sts.<dominio>/.well-known/mta-sts.txt."})
     elif dns_info.get("mx"):
         dns_f.append({"category": "DNS", "title": "MTA-STS nao configurado para dominio com registros MX", "severity": "BAIXO", "action": "Configure _mta-sts e mta-sts.txt."})
-
+    if dns_info.get("domain") and _dig(f"_smtp._tls.{dns_info.get('domain')}", "TXT"):
+        passed.append("TLS-RPT (_smtp._tls) configurado")
     findings = tls_f + web_f + dns_f
     score = max(0, min(100, 100 - sum(SEVERITY_PENALTY.get(f.get("severity", "MEDIO"), 6) for f in findings)))
     return 200, {
-        "version": "2.3",
+        "version": "3.1",
         "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "client_name": client,
         "target": url,
         "host": host,
         "http_status": status,
         "enforces_https": redir,
+        "hosting_context": hosting_ctx,
         "score": score,
         "sub_scores": {"tls": _subscore(tls_f), "headers_cookies": _subscore(web_f), "dns_email": _subscore(dns_f)},
         "hsts": hsts_meta,
