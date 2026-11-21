@@ -1,11 +1,4 @@
-import datetime
-import json
-import re
-import socket
-import ssl
-import urllib.error
-import urllib.parse
-import urllib.request
+import datetime, json, re, socket, ssl, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler
 
 SECURITY_HEADERS = [
@@ -16,775 +9,480 @@ SECURITY_HEADERS = [
     ("Referrer-Policy", "MEDIO", "Adicione o cabecalho Referrer-Policy na resposta HTTP."),
     ("Permissions-Policy", "MEDIO", "Adicione o cabecalho Permissions-Policy na resposta HTTP."),
 ]
-
-SEVERITY_PENALTY = {
-    "CRITICO": 25,
-    "ALTO": 15,
-    "MEDIO": 6,
-    "BAIXO": 3,
-}
-
-_DNS_TYPE_MAP = {
-    "A": 1,
-    "NS": 2,
-    "CNAME": 5,
-    "MX": 15,
-    "TXT": 16,
-    "AAAA": 28,
-    "DS": 43,
-    "DNSKEY": 48,
-    "CAA": 257,
-}
-
+SEVERITY_PENALTY = {"CRITICO": 25, "ALTO": 15, "MEDIO": 6, "BAIXO": 3}
+_DNS_TYPE_MAP = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28, "DS": 43, "DNSKEY": 48, "CAA": 257}
 DKIM_SELECTORS = ("default", "google", "selector1", "selector2", "k1")
 
-
 def _normalize_target(raw_target: str) -> tuple[str, str, int]:
-    value = (raw_target or "").strip()
-    if not value:
+    v = (raw_target or "").strip()
+    if not v:
         raise ValueError("Alvo nao informado.")
-    if not re.match(r"^https?://", value, re.IGNORECASE):
-        value = "https://" + value
-    parsed = urllib.parse.urlparse(value)
-    host = (parsed.hostname or "").strip().lower()
+    if not re.match(r"^https?://", v, re.IGNORECASE):
+        v = "https://" + v
+    p = urllib.parse.urlparse(v)
+    host = (p.hostname or "").strip().lower()
     if not host:
         raise ValueError("Hostname invalido no alvo.")
-    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    normalized_url = urllib.parse.urlunparse((
-        parsed.scheme.lower() or "https",
-        f"{host}:{port}" if parsed.port else host,
-        parsed.path or "/",
-        parsed.params,
-        parsed.query,
-        "",
-    ))
-    return normalized_url, host, port
+    port = p.port or (443 if p.scheme.lower() == "https" else 80)
+    url = urllib.parse.urlunparse((p.scheme.lower() or "https", f"{host}:{port}" if p.port else host, p.path or "/", p.params, p.query, ""))
+    return url, host, port
 
+def _enc_name(name: str) -> bytes:
+    parts = [x.encode("ascii", errors="ignore") for x in name.strip(".").split(".") if x]
+    return b"".join(bytes([len(x)]) + x for x in parts) + b"\x00"
 
-def _encode_dns_name(name: str) -> bytes:
-    parts = [part.encode("ascii", errors="ignore") for part in name.strip(".").split(".") if part]
-    return b"".join(bytes([len(part)]) + part for part in parts) + b"\x00"
-
-
-def _decode_dns_name(buf: bytes, offset: int) -> tuple[str, int]:
-    labels: list[str] = []
-    jumped = False
-    next_offset = offset
-    seen_jumps = 0
-    while offset < len(buf) and seen_jumps < 10:
-        length = buf[offset]
-        if length == 0:
+def _dec_name(buf: bytes, off: int) -> tuple[str, int]:
+    labels, jumped, nxt, jumps = [], False, off, 0
+    while off < len(buf) and jumps < 10:
+        ln = buf[off]
+        if ln == 0:
             if not jumped:
-                next_offset = offset + 1
+                nxt = off + 1
             break
-        if (length & 0xC0) == 0xC0:
-            if offset + 1 >= len(buf):
+        if (ln & 0xC0) == 0xC0:
+            if off + 1 >= len(buf):
                 break
-            pointer = ((length & 0x3F) << 8) | buf[offset + 1]
+            ptr = ((ln & 0x3F) << 8) | buf[off + 1]
             if not jumped:
-                next_offset = offset + 2
-            offset = pointer
-            jumped = True
-            seen_jumps += 1
+                nxt = off + 2
+            off, jumped, jumps = ptr, True, jumps + 1
             continue
-        offset += 1
-        labels.append(buf[offset:offset + length].decode("latin1", errors="ignore"))
-        offset += length
-    return ".".join(labels), next_offset
+        off += 1
+        labels.append(buf[off:off + ln].decode("latin1", errors="ignore"))
+        off += ln
+    return ".".join(labels), nxt
 
-
-def _query_udp_dns_full(host: str, rtype: str, server: str = "1.1.1.1") -> tuple[list[str], bool]:
-    qtype = _DNS_TYPE_MAP.get(rtype.upper())
-    if not qtype:
+def _udp_dns(host: str, rtype: str, srv: str = "1.1.1.1") -> tuple[list[str], bool]:
+    qt = _DNS_TYPE_MAP.get(rtype.upper())
+    if not qt:
         return [], False
-    txid = (sum(ord(ch) for ch in host) + qtype) & 0xFFFF
-    header = txid.to_bytes(2, "big") + b"\x01\x20\x00\x01\x00\x00\x00\x00\x00\x00"
-    question = _encode_dns_name(host) + qtype.to_bytes(2, "big") + (1).to_bytes(2, "big")
-    packet = header + question
-
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(2.5)
-        sock.sendto(packet, (server, 53))
-        resp, _ = sock.recvfrom(4096)
-
+    txid = (sum(ord(c) for c in host) + qt) & 0xFFFF
+    pkt = txid.to_bytes(2, "big") + b"\x01\x20\x00\x01\x00\x00\x00\x00\x00\x00" + _enc_name(host) + qt.to_bytes(2, "big") + (1).to_bytes(2, "big")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(2.5)
+        s.sendto(pkt, (srv, 53))
+        resp, _ = s.recvfrom(4096)
     if len(resp) < 12:
         return [], False
-    flags = int.from_bytes(resp[2:4], "big")
-    ad_flag = bool(flags & 0x0020)
-    qdcount = int.from_bytes(resp[4:6], "big")
-    ancount = int.from_bytes(resp[6:8], "big")
-    idx = 12
-    for _ in range(qdcount):
-        _, idx = _decode_dns_name(resp, idx)
+    ad = bool(int.from_bytes(resp[2:4], "big") & 0x0020)
+    qd, an, idx = int.from_bytes(resp[4:6], "big"), int.from_bytes(resp[6:8], "big"), 12
+    for _ in range(qd):
+        _, idx = _dec_name(resp, idx)
         idx += 4
-
-    results: list[str] = []
-    for _ in range(ancount):
+    out = []
+    for _ in range(an):
         if idx + 10 > len(resp):
             break
-        _, idx = _decode_dns_name(resp, idx)
+        _, idx = _dec_name(resp, idx)
         if idx + 10 > len(resp):
             break
-        rtype_num = int.from_bytes(resp[idx:idx + 2], "big")
-        rdlen = int.from_bytes(resp[idx + 8:idx + 10], "big")
+        rt = int.from_bytes(resp[idx:idx + 2], "big")
+        rdl = int.from_bytes(resp[idx + 8:idx + 10], "big")
         idx += 10
-        rdata = resp[idx:idx + rdlen]
-        idx += rdlen
-        if len(rdata) < rdlen:
+        rd = resp[idx:idx + rdl]
+        idx += rdl
+        if len(rd) < rdl:
             break
-
-        if rtype_num == 1 and rdlen == 4:
-            results.append(".".join(str(b) for b in rdata))
-        elif rtype_num == 28 and rdlen == 16:
-            groups = [rdata[i:i + 2].hex() for i in range(0, 16, 2)]
-            results.append(":".join(groups))
-        elif rtype_num in (2, 5):
-            target_name, _ = _decode_dns_name(resp, idx - rdlen)
-            if target_name:
-                results.append(target_name)
-        elif rtype_num == 15 and rdlen >= 3:
-            pref = int.from_bytes(rdata[0:2], "big")
-            mx_name, _ = _decode_dns_name(resp, idx - rdlen + 2)
-            if mx_name:
-                results.append(f"{pref} {mx_name}")
-        elif rtype_num == 16 and rdlen >= 1:
-            chunks: list[str] = []
-            pos = 0
-            while pos < rdlen:
-                slen = rdata[pos]
+        if rt == 1 and rdl == 4:
+            out.append(".".join(str(b) for b in rd))
+        elif rt == 28 and rdl == 16:
+            out.append(":".join(rd[i:i + 2].hex() for i in range(0, 16, 2)))
+        elif rt in (2, 5):
+            nm, _ = _dec_name(resp, idx - rdl)
+            if nm:
+                out.append(nm)
+        elif rt == 15 and rdl >= 3:
+            pref = int.from_bytes(rd[0:2], "big")
+            mxn, _ = _dec_name(resp, idx - rdl + 2)
+            if mxn:
+                out.append(f"{pref} {mxn}")
+        elif rt == 16 and rdl >= 1:
+            chunks, pos = [], 0
+            while pos < rdl:
+                sl = rd[pos]
                 pos += 1
-                chunks.append(rdata[pos:pos + slen].decode("utf-8", errors="ignore"))
-                pos += slen
-            joined = "".join(chunks).strip()
-            if joined:
-                results.append(joined)
-        elif rtype_num == 257 and rdlen >= 2:
-            c_flags = rdata[0]
-            tlen = rdata[1]
-            tag = rdata[2:2 + tlen].decode("ascii", errors="ignore")
-            val = rdata[2 + tlen:].decode("utf-8", errors="ignore")
-            results.append(f'{c_flags} {tag} "{val}"')
-        elif rtype_num in (43, 48) and rdlen >= 4:
-            results.append(f"type={rtype_num} len={rdlen}")
+                chunks.append(rd[pos:pos + sl].decode("utf-8", errors="ignore"))
+                pos += sl
+            j = "".join(chunks).strip()
+            if j:
+                out.append(j)
+        elif rt == 257 and rdl >= 2:
+            fl, tl = rd[0], rd[1]
+            tag = rd[2:2 + tl].decode("ascii", errors="ignore")
+            val = rd[2 + tl:].decode("utf-8", errors="ignore")
+            out.append(f"{fl} {tag} \"{val}\"")
+        elif rt in (43, 48) and rdl >= 4:
+            out.append(f"type={rt} len={rdl}")
+    return out, ad
 
-    return results, ad_flag
-
-
-def _dig_records_meta(host: str, rtype: str) -> tuple[list[str], bool]:
+def _dig_meta(host: str, rtype: str) -> tuple[list[str], bool]:
     ad_seen = False
     for srv in ("1.1.1.1", "8.8.8.8"):
         try:
-            records, ad = _query_udp_dns_full(host, rtype, srv)
+            recs, ad = _udp_dns(host, rtype, srv)
             ad_seen = ad_seen or ad
-            if records:
-                return records, ad_seen
+            if recs:
+                return recs, ad_seen
         except Exception:
             continue
     try:
-        qtype = _DNS_TYPE_MAP.get(rtype.upper())
-        if qtype:
-            url = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(host)}&type={qtype}"
-            req = urllib.request.Request(
-                url,
-                headers={"Accept": "application/dns-json", "User-Agent": "SecAuditPRO/2.3"},
-            )
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                ad_seen = ad_seen or bool(data.get("AD"))
-                out: list[str] = []
-                for ans in data.get("Answer") or []:
-                    val = str(ans.get("data") or "").strip().strip('"')
-                    if val:
-                        out.append(val)
-                if out:
-                    return out, ad_seen
+        qt = _DNS_TYPE_MAP.get(rtype.upper())
+        if qt:
+            u = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(host)}&type={qt}"
+            req = urllib.request.Request(u, headers={"Accept": "application/dns-json", "User-Agent": "SecAuditPRO/2.3"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                d = json.loads(r.read().decode("utf-8"))
+                ad_seen = ad_seen or bool(d.get("AD"))
+                vals = [str(a.get("data") or "").strip().strip('"') for a in (d.get("Answer") or []) if str(a.get("data") or "").strip()]
+                if vals:
+                    return vals, ad_seen
     except Exception:
         pass
     return [], ad_seen
 
+def _dig(host: str, rtype: str) -> list[str]:
+    return _dig_meta(host, rtype)[0]
 
-def _dig_records(host: str, rtype: str) -> list[str]:
-    recs, _ = _dig_records_meta(host, rtype)
-    return recs
-
-
-def _estimate_spf_lookups(spf_records: list[str]) -> int:
-    if not spf_records:
+def _spf_lookups(spf_recs: list[str]) -> int:
+    if not spf_recs:
         return 0
-    joined = " ".join(spf_records).lower()
-    lookups = 0
-    for token in joined.split():
-        cleaned = re.sub(r"^[+\-~?]", "", token)
-        if cleaned.startswith("include:") or cleaned.startswith("exists:") or cleaned.startswith("redirect="):
-            lookups += 1
-        elif cleaned == "a" or cleaned.startswith("a:") or cleaned.startswith("a/"):
-            lookups += 1
-        elif cleaned == "mx" or cleaned.startswith("mx:") or cleaned.startswith("mx/"):
-            lookups += 1
-        elif cleaned == "ptr" or cleaned.startswith("ptr:"):
-            lookups += 1
-    return lookups
+    cnt = 0
+    for tok in " ".join(spf_recs).lower().split():
+        c = re.sub(r"^[+\-~?]", "", tok)
+        if c.startswith(("include:", "exists:", "redirect=")) or c in ("a", "mx", "ptr") or c.startswith(("a:", "a/", "mx:", "mx/", "ptr:")):
+            cnt += 1
+    return cnt
 
-
-def _check_mta_sts(base_domain: str) -> dict:
-    sts_txt_records = _dig_records(f"_mta-sts.{base_domain}", "TXT")
-    has_sts_dns = any("v=stsv1" in r.lower() for r in sts_txt_records)
-    policy_found = False
-    policy_mode = None
-    if has_sts_dns:
-        policy_url = f"https://mta-sts.{base_domain}/.well-known/mta-sts.txt"
+def _mta_sts(base_domain: str) -> dict:
+    txts = _dig(f"_mta-sts.{base_domain}", "TXT")
+    has_dns = any("v=stsv1" in x.lower() for x in txts)
+    ok, mode = False, None
+    if has_dns:
         try:
-            req = urllib.request.Request(policy_url, headers={"User-Agent": "SecAuditPRO/2.3"})
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                if getattr(resp, "status", 200) == 200:
-                    body = resp.read().decode("utf-8", errors="ignore")
-                    if "version: stsv1" in body.lower():
-                        policy_found = True
-                        m = re.search(r"^\s*mode\s*:\s*([a-zA-Z]+)", body, re.MULTILINE | re.IGNORECASE)
+            req = urllib.request.Request(f"https://mta-sts.{base_domain}/.well-known/mta-sts.txt", headers={"User-Agent": "SecAuditPRO/2.3"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                if getattr(r, "status", 200) == 200:
+                    b = r.read().decode("utf-8", errors="ignore")
+                    if "version: stsv1" in b.lower():
+                        ok = True
+                        m = re.search(r"^\s*mode\s*:\s*([a-zA-Z]+)", b, re.M | re.I)
                         if m:
-                            policy_mode = m.group(1).lower()
+                            mode = m.group(1).lower()
         except Exception:
-            policy_found = False
+            ok = False
+    return {"has_dns_record": has_dns, "dns_records": txts[:3], "policy_accessible": ok, "mode": mode}
 
-    return {
-        "has_dns_record": has_sts_dns,
-        "dns_records": sts_txt_records[:3],
-        "policy_accessible": policy_found,
-        "mode": policy_mode,
-    }
-
-
-def _check_dns_and_email(host: str) -> dict:
+def _dns_email(host: str) -> dict:
     parts = host.split(".")
-    base_domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-    a_records = []
-    aaaa_records = []
+    base = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    a, aaaa = [], []
     try:
-        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        for family, _, _, _, sockaddr in infos:
-            ip = sockaddr[0]
-            if family == socket.AF_INET and ip not in a_records:
-                a_records.append(ip)
-            elif family == socket.AF_INET6 and ip not in aaaa_records:
-                aaaa_records.append(ip)
+        for fam, _, _, _, sa in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            ip = sa[0]
+            if fam == socket.AF_INET and ip not in a:
+                a.append(ip)
+            elif fam == socket.AF_INET6 and ip not in aaaa:
+                aaaa.append(ip)
     except Exception:
         pass
+    if not a:
+        a = _dig(host, "A")
+    if not aaaa:
+        aaaa = _dig(host, "AAAA")
+    mx, ad_mx = _dig_meta(base, "MX")
+    ns, ad_ns = _dig_meta(base, "NS")
+    caa = _dig(base, "CAA")
+    txt = _dig(base, "TXT")
+    dmarc_r = _dig(f"_dmarc.{base}", "TXT")
+    dnskey, _ = _dig_meta(base, "DNSKEY")
 
-    if not a_records:
-        a_records = _dig_records(host, "A")
-    if not aaaa_records:
-        aaaa_records = _dig_records(host, "AAAA")
+    spf = [t for t in txt if "v=spf1" in t.lower()]
+    has_spf = len(spf) > 0
+    spf_strict = any(re.search(r"[-~]all\b", s.lower()) for s in spf)
+    lookups = _spf_lookups(spf)
 
-    mx_records, ad_mx = _dig_records_meta(base_domain, "MX")
-    ns_records, ad_ns = _dig_records_meta(base_domain, "NS")
-    caa_records = _dig_records(base_domain, "CAA")
-    txt_records = _dig_records(base_domain, "TXT")
-    dmarc_records = _dig_records(f"_dmarc.{base_domain}", "TXT")
-    dnskey_records, _ = _dig_records_meta(base_domain, "DNSKEY")
-
-    spf_records = [t for t in txt_records if "v=spf1" in t.lower()]
-    has_spf = len(spf_records) > 0
-    spf_strict = any(re.search(r"[-~]all\b", s.lower()) for s in spf_records)
-    spf_lookups = _estimate_spf_lookups(spf_records)
-
-    dmarc_valid = [d for d in dmarc_records if "v=dmarc1" in d.lower()]
-    has_dmarc = len(dmarc_valid) > 0
-    dmarc_policy = None
+    dmarc_v = [d for d in dmarc_r if "v=dmarc1" in d.lower()]
+    has_dmarc = len(dmarc_v) > 0
+    pol = None
     if has_dmarc:
-        m = re.search(r"\bp=([a-zA-Z]+)", dmarc_valid[0], re.IGNORECASE)
+        m = re.search(r"\bp=([a-zA-Z]+)", dmarc_v[0], re.I)
         if m:
-            dmarc_policy = m.group(1).lower()
+            pol = m.group(1).lower()
 
-    dkim_found: list[str] = []
+    dkim = []
     for sel in DKIM_SELECTORS:
-        qname = f"{sel}._domainkey.{base_domain}"
-        txts = _dig_records(qname, "TXT")
-        cnames = _dig_records(qname, "CNAME") if not txts else []
-        if any("v=dkim1" in t.lower() or "p=" in t.lower() for t in txts) or cnames:
-            dkim_found.append(sel)
-
-    dnssec_enabled = bool(ad_mx or ad_ns or dnskey_records)
-    mta_sts = _check_mta_sts(base_domain)
-    has_caa = len(caa_records) > 0
+        qn = f"{sel}._domainkey.{base}"
+        tx = _dig(qn, "TXT")
+        cn = _dig(qn, "CNAME") if not tx else []
+        if any("v=dkim1" in x.lower() or "p=" in x.lower() for x in tx) or cn:
+            dkim.append(sel)
 
     return {
-        "domain": base_domain,
-        "a": a_records[:6],
-        "aaaa": aaaa_records[:6],
-        "mx": mx_records[:6],
-        "ns": ns_records[:6],
-        "caa": caa_records[:6],
-        "spf": spf_records[:3],
-        "dmarc": dmarc_valid[:3],
-        "dkim_selectors": dkim_found,
-        "mta_sts": mta_sts,
-        "has_spf": has_spf,
-        "spf_strict": spf_strict,
-        "spf_lookups": spf_lookups,
-        "has_dmarc": has_dmarc,
-        "dmarc_policy": dmarc_policy,
-        "has_dkim": len(dkim_found) > 0,
-        "has_caa": has_caa,
-        "dnssec_enabled": dnssec_enabled,
+        "domain": base, "a": a[:6], "aaaa": aaaa[:6], "mx": mx[:6], "ns": ns[:6], "caa": caa[:6],
+        "spf": spf[:3], "dmarc": dmarc_v[:3], "dkim_selectors": dkim, "mta_sts": _mta_sts(base),
+        "has_spf": has_spf, "spf_strict": spf_strict, "spf_lookups": lookups,
+        "has_dmarc": has_dmarc, "dmarc_policy": pol, "has_dkim": len(dkim) > 0,
+        "has_caa": len(caa) > 0, "dnssec_enabled": bool(ad_mx or ad_ns or dnskey),
     }
 
+def _parse_csp(csp_val: str) -> dict[str, list[str]]:
+    dirs = {}
+    for part in (csp_val or "").split(";"):
+        toks = [t.strip() for t in part.strip().split() if t.strip()]
+        if toks:
+            dirs[toks[0].lower()] = [t.lower() for t in toks[1:]]
+    return dirs
 
-def _parse_csp_directives(csp_val: str) -> dict[str, list[str]]:
-    directives: dict[str, list[str]] = {}
-    for raw_dir in (csp_val or "").split(";"):
-        tokens = [t.strip() for t in raw_dir.strip().split() if t.strip()]
-        if not tokens:
-            continue
-        name = tokens[0].lower()
-        directives[name] = [t.lower() for t in tokens[1:]]
-    return directives
-
-
-def _probe_tls_version(host: str, port: int, tls_ver) -> bool:
+def _probe_tls(host: str, port: int, ver) -> bool:
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.minimum_version = tls_ver
-        ctx.maximum_version = tls_ver
-        with socket.create_connection((host, port), timeout=3) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host):
+        ctx.minimum_version = ver
+        ctx.maximum_version = ver
+        with socket.create_connection((host, port), timeout=3) as s:
+            with ctx.wrap_socket(s, server_hostname=host):
                 return True
     except Exception:
         return False
 
-
-def _check_tls(host: str, port: int = 443) -> dict:
+def _tls(host: str, port: int = 443) -> dict:
     ctx = ssl.create_default_context()
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
     try:
-        with socket.create_connection((host, port), timeout=5) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                cert = ssock.getpeercert()
-                protocol = ssock.version()
-                cipher_info = ssock.cipher()
-                cipher_name = cipher_info[0] if cipher_info else None
-                issuer_parts = cert.get("issuer", ())
+        with socket.create_connection((host, port), timeout=5) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                cert = ss.getpeercert()
                 issuer = "Desconhecido"
-                for tup in issuer_parts:
+                for tup in cert.get("issuer", ()):
                     for k, v in tup:
                         if k == "organizationName":
                             issuer = v
                             break
                     if issuer != "Desconhecido":
                         break
-                not_after = cert.get("notAfter", "")
-                days_remaining = None
-                if not_after:
+                na = cert.get("notAfter", "")
+                days = None
+                if na:
                     try:
-                        exp_dt = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(
-                            tzinfo=datetime.timezone.utc
-                        )
-                        now_dt = datetime.datetime.now(datetime.timezone.utc)
-                        days_remaining = int((exp_dt - now_dt).total_seconds() // 86400)
+                        exp = datetime.datetime.strptime(na, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
+                        days = int((exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 86400)
                     except Exception:
-                        days_remaining = None
-
-                supports_tls12 = _probe_tls_version(host, port, ssl.TLSVersion.TLSv1_2)
-                supports_tls13 = _probe_tls_version(host, port, ssl.TLSVersion.TLSv1_3)
-
+                        days = None
                 return {
-                    "tls_valid": True,
-                    "protocol": protocol,
-                    "cipher": cipher_name,
-                    "issuer": issuer,
-                    "not_after": not_after,
-                    "days_remaining": days_remaining,
-                    "supports_tls12": supports_tls12,
-                    "supports_tls13": supports_tls13,
+                    "tls_valid": True, "protocol": ss.version(),
+                    "cipher": ss.cipher()[0] if ss.cipher() else None,
+                    "issuer": issuer, "not_after": na, "days_remaining": days,
+                    "supports_tls12": _probe_tls(host, port, ssl.TLSVersion.TLSv1_2),
+                    "supports_tls13": _probe_tls(host, port, ssl.TLSVersion.TLSv1_3),
                 }
-    except Exception as exc:
-        return {
-            "tls_valid": False,
-            "protocol": None,
-            "cipher": None,
-            "issuer": None,
-            "not_after": None,
-            "days_remaining": None,
-            "supports_tls12": False,
-            "supports_tls13": False,
-            "error": str(exc),
-        }
+    except Exception as e:
+        return {"tls_valid": False, "protocol": None, "cipher": None, "issuer": None, "not_after": None, "days_remaining": None, "supports_tls12": False, "supports_tls13": False, "error": str(e)}
 
-
-def _check_http_redirect(host: str) -> bool:
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
+def _https_redirect(host: str) -> bool:
+    class NoRedir(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
-
-    opener = urllib.request.build_opener(NoRedirect())
+    op = urllib.request.build_opener(NoRedir())
     req = urllib.request.Request(f"http://{host}/", headers={"User-Agent": "SecAuditPRO/2.3"})
     try:
-        with opener.open(req, timeout=5) as resp:
-            loc = (resp.headers.get("Location") or "").lower()
-            return resp.status in (301, 302, 307, 308) and loc.startswith("https://")
-    except urllib.error.HTTPError as err:
-        loc = (err.headers.get("Location") or "").lower() if err.headers else ""
-        return err.code in (301, 302, 307, 308) and loc.startswith("https://")
+        with op.open(req, timeout=5) as r:
+            loc = (r.headers.get("Location") or "").lower()
+            return r.status in (301, 302, 307, 308) and loc.startswith("https://")
+    except urllib.error.HTTPError as e:
+        loc = (e.headers.get("Location") or "").lower() if e.headers else ""
+        return e.code in (301, 302, 307, 308) and loc.startswith("https://")
     except Exception:
         return False
 
-
-def _fetch_target_headers(url: str) -> tuple[int, dict[str, str], list[str]]:
+def _fetch_hdrs(url: str) -> tuple[int, dict[str, str], list[str]]:
     req = urllib.request.Request(url, headers={"User-Agent": "SecAuditPRO/2.3"})
-    set_cookies: list[str] = []
+    cookies = []
     try:
-        with urllib.request.urlopen(req, timeout=7) as resp:
-            status = getattr(resp, "status", 200)
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            if hasattr(resp.headers, "get_all"):
-                set_cookies = resp.headers.get_all("Set-Cookie") or []
+        with urllib.request.urlopen(req, timeout=7) as r:
+            hdrs = {k.lower(): v for k, v in r.headers.items()}
+            if hasattr(r.headers, "get_all"):
+                cookies = r.headers.get_all("Set-Cookie") or []
             elif "set-cookie" in hdrs:
-                set_cookies = [hdrs["set-cookie"]]
-            return status, hdrs, set_cookies
-    except urllib.error.HTTPError as err:
-        hdrs = {k.lower(): v for k, v in err.headers.items()} if err.headers else {}
-        if err.headers and hasattr(err.headers, "get_all"):
-            set_cookies = err.headers.get_all("Set-Cookie") or []
-        return err.code, hdrs, set_cookies
+                cookies = [hdrs["set-cookie"]]
+            return getattr(r, "status", 200), hdrs, cookies
+    except urllib.error.HTTPError as e:
+        hdrs = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        if e.headers and hasattr(e.headers, "get_all"):
+            cookies = e.headers.get_all("Set-Cookie") or []
+        return e.code, hdrs, cookies
 
-
-def _calc_subscore(items: list[dict]) -> int:
-    pen = sum(SEVERITY_PENALTY.get(i.get("severity", "MEDIO"), 6) for i in items)
-    return max(0, min(100, 100 - pen))
-
+def _subscore(items: list[dict]) -> int:
+    return max(0, min(100, 100 - sum(SEVERITY_PENALTY.get(i.get("severity", "MEDIO"), 6) for i in items)))
 
 def run_audit(payload: dict) -> tuple[int, dict]:
     if not isinstance(payload, dict) or payload.get("authorized") is not True:
-        return 403, {
-            "error": 'Auditoria nao autorizada. Defina "authorized": true para executar o diagnostico.',
-            "code": "AUTHORIZATION_REQUIRED",
-        }
-
-    raw_target = payload.get("target") or payload.get("url") or ""
-    client_name = (payload.get("client_name") or "Cliente Nao Informado").strip() or "Cliente Nao Informado"
-
+        return 403, {"error": 'Auditoria nao autorizada. Defina "authorized": true para executar o diagnostico.', "code": "AUTHORIZATION_REQUIRED"}
+    client = (payload.get("client_name") or "Cliente Nao Informado").strip() or "Cliente Nao Informado"
     try:
-        target_url, host, port = _normalize_target(raw_target)
-    except ValueError as exc:
-        return 400, {"error": str(exc)}
+        url, host, port = _normalize_target(payload.get("target") or payload.get("url") or "")
+    except ValueError as e:
+        return 400, {"error": str(e)}
 
-    tls_findings: list[dict] = []
-    web_findings: list[dict] = []
-    dns_findings: list[dict] = []
-    passed_checks: list[str] = []
-
-    tls_info = _check_tls(host, port if port != 80 else 443)
+    tls_f, web_f, dns_f, passed = [], [], [], []
+    tls_info = _tls(host, port if port != 80 else 443)
     if tls_info.get("tls_valid"):
-        passed_checks.append(f"Certificado TLS valido ({tls_info.get('protocol')})")
+        passed.append(f"Certificado TLS valido ({tls_info.get('protocol')})")
         if tls_info.get("supports_tls13"):
-            passed_checks.append("Suporte a TLSv1.3 confirmado")
-        days_rem = tls_info.get("days_remaining")
-        if isinstance(days_rem, int):
-            if days_rem <= 7:
-                tls_findings.append({
-                    "category": "TLS",
-                    "title": f"Certificado TLS expira em {days_rem} dia(s)",
-                    "severity": "CRITICO",
-                    "action": "Renove imediatamente o certificado TLS/SSL para evitar indisponibilidade.",
-                })
-            elif days_rem <= 30:
-                tls_findings.append({
-                    "category": "TLS",
-                    "title": f"Certificado TLS expira em {days_rem} dias",
-                    "severity": "ALTO",
-                    "action": "Agende a renovacao automatica ou manual do certificado TLS/SSL.",
-                })
+            passed.append("Suporte a TLSv1.3 confirmado")
+        d = tls_info.get("days_remaining")
+        if isinstance(d, int):
+            if d <= 7:
+                tls_f.append({"category": "TLS", "title": f"Certificado TLS expira em {d} dia(s)", "severity": "CRITICO", "action": "Renove imediatamente o certificado TLS/SSL."})
+            elif d <= 30:
+                tls_f.append({"category": "TLS", "title": f"Certificado TLS expira em {d} dias", "severity": "ALTO", "action": "Agende a renovacao do certificado TLS/SSL."})
             else:
-                passed_checks.append(f"Validade TLS saudavel ({days_rem} dias restantes)")
+                passed.append(f"Validade TLS saudavel ({d} dias restantes)")
     else:
-        tls_findings.append({
-            "category": "TLS",
-            "title": "Falha na validacao TLS/SSL do alvo",
-            "severity": "CRITICO",
-            "action": "Verifique cadeia de certificados, dominio e configuracao TLS no servidor.",
-        })
+        tls_f.append({"category": "TLS", "title": "Falha na validacao TLS/SSL do alvo", "severity": "CRITICO", "action": "Verifique certificados, dominio e TLS no servidor."})
 
-    enforces_https = _check_http_redirect(host)
-    if enforces_https:
-        passed_checks.append("Redirecionamento HTTP para HTTPS ativo")
+    redir = _https_redirect(host)
+    if redir:
+        passed.append("Redirecionamento HTTP para HTTPS ativo")
     else:
-        tls_findings.append({
-            "category": "TLS",
-            "title": "HTTP nao redireciona obrigatoriamente para HTTPS",
-            "severity": "ALTO",
-            "action": "Configure redirecionamento 301 de HTTP para HTTPS no servidor ou CDN.",
-        })
+        tls_f.append({"category": "TLS", "title": "HTTP nao redireciona obrigatoriamente para HTTPS", "severity": "ALTO", "action": "Configure redirecionamento 301 de HTTP para HTTPS."})
 
     try:
-        http_status, headers, cookies = _fetch_target_headers(target_url)
-    except Exception as exc:
-        return 502, {
-            "error": f"Falha ao conectar no alvo {target_url}: {exc}",
-            "target": target_url,
-            "host": host,
-        }
+        status, hdrs, cookies = _fetch_hdrs(url)
+    except Exception as e:
+        return 502, {"error": f"Falha ao conectar no alvo {url}: {e}", "target": url, "host": host}
 
-    for header_name, severity, action in SECURITY_HEADERS:
-        if headers.get(header_name.lower()):
-            passed_checks.append(f"Cabecalho {header_name} presente")
+    for hname, sev, act in SECURITY_HEADERS:
+        if hdrs.get(hname.lower()):
+            passed.append(f"Cabecalho {hname} presente")
         else:
-            web_findings.append({
-                "category": "HEADERS",
-                "title": f"Cabecalho de seguranca ausente: {header_name}",
-                "severity": severity,
-                "action": action,
-            })
+            web_f.append({"category": "HEADERS", "title": f"Cabecalho de seguranca ausente: {hname}", "severity": sev, "action": act})
 
-    hsts_val = headers.get("strict-transport-security", "")
-    hsts_meta = {"present": bool(hsts_val), "max_age": None, "include_subdomains": False, "preload": False}
-    if hsts_val:
-        hsts_low = hsts_val.lower()
-        hsts_meta["include_subdomains"] = "includesubdomains" in hsts_low
-        hsts_meta["preload"] = "preload" in hsts_low
-        m_age = re.search(r"max-age\s*=\s*(\d+)", hsts_val, re.IGNORECASE)
-        if m_age:
-            age_sec = int(m_age.group(1))
-            hsts_meta["max_age"] = age_sec
-            if age_sec < 15552000:
-                web_findings.append({
-                    "category": "HEADERS",
-                    "title": f"HSTS com max-age curto ({age_sec}s)",
-                    "severity": "BAIXO",
-                    "action": "Aumente max-age para pelo menos 15552000 (180 dias) ou 31536000 (1 ano).",
-                })
+    hsts_raw = hdrs.get("strict-transport-security", "")
+    hsts_meta = {"present": bool(hsts_raw), "max_age": None, "include_subdomains": False, "preload": False}
+    if hsts_raw:
+        hsts_meta["include_subdomains"] = "includesubdomains" in hsts_raw.lower()
+        hsts_meta["preload"] = "preload" in hsts_raw.lower()
+        ma = re.search(r"max-age\s*=\s*(\d+)", hsts_raw, re.I)
+        if ma:
+            age = int(ma.group(1))
+            hsts_meta["max_age"] = age
+            if age < 15552000:
+                web_f.append({"category": "HEADERS", "title": f"HSTS com max-age curto ({age}s)", "severity": "BAIXO", "action": "Use max-age >= 15552000 (180 dias)."})
             else:
-                passed_checks.append("HSTS configurado com max-age robusto")
+                passed.append("HSTS configurado com max-age robusto")
 
-    csp_val = headers.get("content-security-policy", "")
-    csp_analysis = {
-        "present": bool(csp_val),
-        "directives_count": 0,
-        "has_unsafe_inline_or_eval": False,
-        "has_wildcard_script_or_default": False,
-        "has_object_src_none": False,
-        "has_frame_ancestors": False,
-    }
-    if csp_val:
-        dirs = _parse_csp_directives(csp_val)
-        csp_analysis["directives_count"] = len(dirs)
-        csp_low = csp_val.lower()
-        if "'unsafe-inline'" in csp_low or "'unsafe-eval'" in csp_low:
-            csp_analysis["has_unsafe_inline_or_eval"] = True
-            web_findings.append({
-                "category": "HEADERS",
-                "title": "Content-Security-Policy permite unsafe-inline ou unsafe-eval",
-                "severity": "BAIXO",
-                "action": "Substitua unsafe-inline/unsafe-eval por nonces ou hashes quando possivel.",
-            })
+    csp_raw = hdrs.get("content-security-policy", "")
+    csp_meta = {"present": bool(csp_raw), "directives_count": 0, "has_unsafe_inline_or_eval": False, "has_wildcard_script_or_default": False, "has_object_src_none": False, "has_frame_ancestors": False}
+    if csp_raw:
+        ds = _parse_csp(csp_raw)
+        csp_meta["directives_count"] = len(ds)
+        if "'unsafe-inline'" in csp_raw.lower() or "'unsafe-eval'" in csp_raw.lower():
+            csp_meta["has_unsafe_inline_or_eval"] = True
+            web_f.append({"category": "HEADERS", "title": "Content-Security-Policy permite unsafe-inline ou unsafe-eval", "severity": "BAIXO", "action": "Prefira nonces ou hashes em vez de unsafe-inline/unsafe-eval."})
         else:
-            passed_checks.append("CSP sem diretivas unsafe-inline/unsafe-eval")
+            passed.append("CSP sem diretivas unsafe-inline/unsafe-eval")
+        stoks = ds.get("script-src") or ds.get("default-src") or []
+        if "*" in stoks or "data:" in stoks:
+            csp_meta["has_wildcard_script_or_default"] = True
+            web_f.append({"category": "HEADERS", "title": "CSP com fonte ampla (* ou data:) em script-src/default-src", "severity": "MEDIO", "action": "Restrinja origens de scripts a dominios confiaveis."})
+        otoks = ds.get("object-src") or []
+        if "'none'" in otoks:
+            csp_meta["has_object_src_none"] = True
+            passed.append("CSP bloqueia plugins via object-src 'none'")
+        elif "object-src" not in ds and "'none'" not in (ds.get("default-src") or []):
+            web_f.append({"category": "HEADERS", "title": "CSP sem object-src 'none' explicito", "severity": "BAIXO", "action": "Adicione object-src 'none' na CSP."})
+        if "frame-ancestors" in ds:
+            csp_meta["has_frame_ancestors"] = True
+            passed.append("CSP define frame-ancestors contra clickjacking")
 
-        script_tokens = dirs.get("script-src") or dirs.get("default-src") or []
-        if "*" in script_tokens or "data:" in script_tokens:
-            csp_analysis["has_wildcard_script_or_default"] = True
-            web_findings.append({
-                "category": "HEADERS",
-                "title": "CSP com fonte ampla (* ou data:) em script-src/default-src",
-                "severity": "MEDIO",
-                "action": "Restrinja origens de scripts a dominios confiaveis ou nonces.",
-            })
+    for h_iso, label in (("cross-origin-opener-policy", "Cross-Origin-Opener-Policy"), ("cross-origin-resource-policy", "Cross-Origin-Resource-Policy")):
+        if (hdrs.get(h_iso) or "").strip():
+            passed.append(f"Cabecalho {label} presente ({hdrs.get(h_iso).strip()})")
 
-        obj_tokens = dirs.get("object-src") or []
-        if "'none'" in obj_tokens:
-            csp_analysis["has_object_src_none"] = True
-            passed_checks.append("CSP bloqueia plugins via object-src 'none'")
-        elif "object-src" not in dirs and "'none'" not in (dirs.get("default-src") or []):
-            web_findings.append({
-                "category": "HEADERS",
-                "title": "CSP sem object-src 'none' explicito",
-                "severity": "BAIXO",
-                "action": "Adicione object-src 'none' na politica CSP para mitigar execucao de objetos legados.",
-            })
+    srv = hdrs.get("server", "")
+    if re.search(r"[/]\s*\d+(\.\d+)+", srv):
+        web_f.append({"category": "HEADERS", "title": f"Versao explicita do servidor exposta ({srv})", "severity": "BAIXO", "action": "Oculte versoes exatas no cabecalho Server."})
+    xpb = hdrs.get("x-powered-by", "")
+    if xpb:
+        web_f.append({"category": "HEADERS", "title": f"Tecnologia interna exposta em X-Powered-By ({xpb})", "severity": "BAIXO", "action": "Remova X-Powered-By na resposta HTTP."})
+    if (hdrs.get("access-control-allow-origin") or "").strip() == "*":
+        web_f.append({"category": "HEADERS", "title": "CORS permissivo irrestrito (Access-Control-Allow-Origin: *)", "severity": "MEDIO", "action": "Restrinja Access-Control-Allow-Origin as origens confiaveis."})
 
-        if "frame-ancestors" in dirs:
-            csp_analysis["has_frame_ancestors"] = True
-            passed_checks.append("CSP define frame-ancestors contra clickjacking")
+    for rc in cookies:
+        cl = rc.lower()
+        cn = rc.split("=", 1)[0].strip() or "cookie"
+        if "httponly" not in cl:
+            web_f.append({"category": "COOKIES", "title": f"Cookie sem flag HttpOnly: {cn}", "severity": "MEDIO", "action": f"Adicione HttpOnly ao cookie {cn}."})
+        if url.startswith("https://") and "secure" not in cl:
+            web_f.append({"category": "COOKIES", "title": f"Cookie sem flag Secure em HTTPS: {cn}", "severity": "MEDIO", "action": f"Adicione Secure ao cookie {cn}."})
+        if "samesite=" not in cl:
+            web_f.append({"category": "COOKIES", "title": f"Cookie sem atributo SameSite: {cn}", "severity": "BAIXO", "action": f"Defina SameSite=Lax ou Strict no cookie {cn}."})
 
-    coop_val = (headers.get("cross-origin-opener-policy") or "").strip()
-    corp_val = (headers.get("cross-origin-resource-policy") or "").strip()
-    if coop_val:
-        passed_checks.append(f"Cabecalho Cross-Origin-Opener-Policy presente ({coop_val})")
-    if corp_val:
-        passed_checks.append(f"Cabecalho Cross-Origin-Resource-Policy presente ({corp_val})")
-
-    server_banner = headers.get("server", "")
-    if re.search(r"[/]\s*\d+(\.\d+)+", server_banner):
-        web_findings.append({
-            "category": "HEADERS",
-            "title": f"Versao explicita do servidor exposta ({server_banner})",
-            "severity": "BAIXO",
-            "action": "Oculte versoes exatas de software no cabecalho Server.",
-        })
-
-    powered_by = headers.get("x-powered-by", "")
-    if powered_by:
-        web_findings.append({
-            "category": "HEADERS",
-            "title": f"Tecnologia interna exposta em X-Powered-By ({powered_by})",
-            "severity": "BAIXO",
-            "action": "Remova o cabecalho X-Powered-By na configuracao do servidor ou framework.",
-        })
-
-    aco = (headers.get("access-control-allow-origin") or "").strip()
-    if aco == "*":
-        web_findings.append({
-            "category": "HEADERS",
-            "title": "CORS permissivo irrestrito (Access-Control-Allow-Origin: *)",
-            "severity": "MEDIO",
-            "action": "Restrinja Access-Control-Allow-Origin apenas as origens confiaveis.",
-        })
-
-    for raw_cookie in cookies:
-        c_low = raw_cookie.lower()
-        c_name = raw_cookie.split("=", 1)[0].strip() or "cookie"
-        if "httponly" not in c_low:
-            web_findings.append({
-                "category": "COOKIES",
-                "title": f"Cookie sem flag HttpOnly: {c_name}",
-                "severity": "MEDIO",
-                "action": f"Adicione HttpOnly ao cookie {c_name} para reduzir risco de roubo via XSS.",
-            })
-        if target_url.startswith("https://") and "secure" not in c_low:
-            web_findings.append({
-                "category": "COOKIES",
-                "title": f"Cookie sem flag Secure em HTTPS: {c_name}",
-                "severity": "MEDIO",
-                "action": f"Adicione Secure ao cookie {c_name} para envio apenas sobre HTTPS.",
-            })
-        if "samesite=" not in c_low:
-            web_findings.append({
-                "category": "COOKIES",
-                "title": f"Cookie sem atributo SameSite: {c_name}",
-                "severity": "BAIXO",
-                "action": f"Defina SameSite=Lax ou SameSite=Strict no cookie {c_name} contra CSRF.",
-            })
-
-    dns_info = _check_dns_and_email(host)
+    dns_info = _dns_email(host)
     if dns_info.get("has_spf"):
-        lookups = dns_info.get("spf_lookups", 0)
-        passed_checks.append(f"Registro SPF configurado ({lookups} DNS lookup(s) estimados)")
-        if lookups > 10:
-            dns_findings.append({
-                "category": "DNS",
-                "title": f"SPF excede limite de 10 DNS lookups ({lookups} estimados)",
-                "severity": "MEDIO",
-                "action": "Consolide includes ou aplique flattening no registro SPF para evitar PermError.",
-            })
-        elif lookups >= 8:
-            dns_findings.append({
-                "category": "DNS",
-                "title": f"SPF proximo do limite de 10 DNS lookups ({lookups} estimados)",
-                "severity": "BAIXO",
-                "action": "Monitore os includes do SPF para nao ultrapassar 10 consultas DNS.",
-            })
+        lk = dns_info.get("spf_lookups", 0)
+        passed.append(f"Registro SPF configurado ({lk} DNS lookup(s) estimados)")
+        if lk > 10:
+            dns_f.append({"category": "DNS", "title": f"SPF excede limite de 10 DNS lookups ({lk} estimados)", "severity": "MEDIO", "action": "Consolide includes ou aplique flattening no SPF."})
+        elif lk >= 8:
+            dns_f.append({"category": "DNS", "title": f"SPF proximo do limite de 10 DNS lookups ({lk} estimados)", "severity": "BAIXO", "action": "Monitore os includes do SPF para ficar <= 10 lookups."})
         if not dns_info.get("spf_strict"):
-            dns_findings.append({
-                "category": "DNS",
-                "title": "Politica SPF sem fechamento restritivo (~all ou -all)",
-                "severity": "BAIXO",
-                "action": "Finalize o registro SPF com ~all ou -all para evitar autorizacao aberta.",
-            })
+            dns_f.append({"category": "DNS", "title": "Politica SPF sem fechamento restritivo (~all ou -all)", "severity": "BAIXO", "action": "Finalize o SPF com ~all ou -all."})
     else:
-        dns_findings.append({
-            "category": "DNS",
-            "title": f"Registro SPF ausente em {dns_info.get('domain')}",
-            "severity": "MEDIO",
-            "action": "Publique um registro TXT v=spf1 para autorizar remetentes de e-mail.",
-        })
+        dns_f.append({"category": "DNS", "title": f"Registro SPF ausente em {dns_info.get('domain')}", "severity": "MEDIO", "action": "Publique registro TXT v=spf1."})
 
     if dns_info.get("has_dmarc"):
         pol = dns_info.get("dmarc_policy") or "desconhecida"
         if pol == "none":
-            dns_findings.append({
-                "category": "DNS",
-                "title": "DMARC em modo apenas monitoramento (p=none)",
-                "severity": "BAIXO",
-                "action": "Evolua a politica DMARC para p=quarantine ou p=reject apos validar os relatorios.",
-            })
+            dns_f.append({"category": "DNS", "title": "DMARC em modo apenas monitoramento (p=none)", "severity": "BAIXO", "action": "Evolua DMARC para p=quarantine ou p=reject."})
         else:
-            passed_checks.append(f"DMARC ativo com politica restritiva (p={pol})")
+            passed.append(f"DMARC ativo com politica restritiva (p={pol})")
     else:
-        dns_findings.append({
-            "category": "DNS",
-            "title": f"Registro DMARC ausente em _dmarc.{dns_info.get('domain')}",
-            "severity": "MEDIO",
-            "action": "Configure registro TXT em _dmarc com politica de monitoramento ou rejeicao.",
-        })
+        dns_f.append({"category": "DNS", "title": f"Registro DMARC ausente em _dmarc.{dns_info.get('domain')}", "severity": "MEDIO", "action": "Configure registro TXT em _dmarc."})
 
     if dns_info.get("has_dkim"):
-        passed_checks.append(f"DKIM detectado ({', '.join(dns_info.get('dkim_selectors') or [])})")
-
+        passed.append(f"DKIM detectado ({ ', '.join(dns_info.get('dkim_selectors') or []) })")
     if dns_info.get("has_caa"):
-        passed_checks.append("Registro CAA configurado para emissao de certificados")
-
+        passed.append("Registro CAA configurado para emissao de certificados")
     if dns_info.get("dnssec_enabled"):
-        passed_checks.append("DNSSEC autenticado no dominio")
+        passed.append("DNSSEC autenticado no dominio")
     else:
-        dns_findings.append({
-            "category": "DNS",
-            "title": f"DNSSEC nao autenticado em {dns_info.get('domain')}",
-            "severity": "BAIXO",
-            "action": "Habilite DNSSEC no registrador/DNS para proteger a integridade das respostas DNS.",
-        })
+        dns_f.append({"category": "DNS", "title": f"DNSSEC nao autenticado em {dns_info.get('domain')}", "severity": "BAIXO", "action": "Habilite DNSSEC no DNS/registrador."})
 
-    mta_sts = dns_info.get("mta_sts") or {}
-    if mta_sts.get("has_dns_record") and mta_sts.get("policy_accessible"):
-        passed_checks.append(f"MTA-STS ativo (modo: {mta_sts.get('mode') or 'detectado'})")
-    elif mta_sts.get("has_dns_record"):
-        dns_findings.append({
-            "category": "DNS",
-            "title": "Registro _mta-sts presente, mas politica /.well-known/mta-sts.txt inacessivel",
-            "severity": "BAIXO",
-            "action": "Publique o arquivo mta-sts.txt em https://mta-sts.<dominio>/.well-known/mta-sts.txt.",
-        })
+    mta = dns_info.get("mta_sts") or {}
+    if mta.get("has_dns_record") and mta.get("policy_accessible"):
+        passed.append(f"MTA-STS ativo (modo: {mta.get('mode') or 'detectado'})")
+    elif mta.get("has_dns_record"):
+        dns_f.append({"category": "DNS", "title": "Registro _mta-sts presente, mas politica /.well-known/mta-sts.txt inacessivel", "severity": "BAIXO", "action": "Publique mta-sts.txt em https://mta-sts.<dominio>/.well-known/mta-sts.txt."})
     elif dns_info.get("mx"):
-        dns_findings.append({
-            "category": "DNS",
-            "title": "MTA-STS nao configurado para dominio com registros MX",
-            "severity": "BAIXO",
-            "action": "Configure _mta-sts e a politica mta-sts.txt para exigir TLS na entrega de e-mails.",
-        })
+        dns_f.append({"category": "DNS", "title": "MTA-STS nao configurado para dominio com registros MX", "severity": "BAIXO", "action": "Configure _mta-sts e mta-sts.txt."})
 
-    findings = tls_findings + web_findings + dns_findings
-    total_penalty = sum(SEVERITY_PENALTY.get(f.get("severity", "MEDIO"), 6) for f in findings)
-    score = max(0, min(100, 100 - total_penalty))
-
-    result = {
+    findings = tls_f + web_f + dns_f
+    score = max(0, min(100, 100 - sum(SEVERITY_PENALTY.get(f.get("severity", "MEDIO"), 6) for f in findings)))
+    return 200, {
         "version": "2.3",
         "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "client_name": client_name,
-        "target": target_url,
+        "client_name": client,
+        "target": url,
         "host": host,
-        "http_status": http_status,
-        "enforces_https": enforces_https,
+        "http_status": status,
+        "enforces_https": redir,
         "score": score,
-        "sub_scores": {
-            "tls": _calc_subscore(tls_findings),
-            "headers_cookies": _calc_subscore(web_findings),
-            "dns_email": _calc_subscore(dns_findings),
-        },
+        "sub_scores": {"tls": _subscore(tls_f), "headers_cookies": _subscore(web_f), "dns_email": _subscore(dns_f)},
         "hsts": hsts_meta,
-        "csp_analysis": csp_analysis,
+        "csp_analysis": csp_meta,
         "tls": tls_info,
         "dns": dns_info,
         "findings": findings,
-        "passed_checks": passed_checks,
+        "passed_checks": passed,
     }
-    return 200, result
-
 
 class handler(BaseHTTPRequestHandler):
-    def _send_json(self, status_code: int, body: dict):
+    def _send_json(self, code: int, body: dict):
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        self.send_response(status_code)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -794,100 +492,63 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.end_headers()
+        self._send_json(204, {}) if False else (
+            self.send_response(204),
+            self.send_header("Access-Control-Allow-Origin", "*"),
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+            self.end_headers(),
+        )
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        self._send_json(200, {
-            "service": "SecAudit PRO API",
-            "status": "online",
-            "version": "2.3",
-            "endpoint": path or "/api/check-web",
-        })
+        p = urllib.parse.urlparse(self.path).path
+        self._send_json(200, {"service": "SecAudit PRO API", "status": "online", "version": "2.3", "endpoint": p or "/api/check-web"})
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or "0")
-        raw_body = self.rfile.read(length) if length > 0 else b"{}"
+        n = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(n) if n > 0 else b"{}"
         try:
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
+            payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             self._send_json(400, {"error": "JSON invalido no corpo da requisicao."})
             return
-
         try:
-            status_code, response_body = run_audit(payload)
-        except Exception as exc:
-            status_code = 500
-            response_body = {"error": f"Erro interno na auditoria: {exc}", "type": type(exc).__name__}
-        self._send_json(status_code, response_body)
-
+            st, body = run_audit(payload)
+        except Exception as e:
+            st, body = 500, {"error": f"Erro interno na auditoria: {e}", "type": type(e).__name__}
+        self._send_json(st, body)
 
 def app(environ, start_response):
-    method = (environ.get("REQUEST_METHOD") or "GET").upper()
-    path = environ.get("PATH_INFO") or "/api/check-web"
-    if method == "OPTIONS":
-        start_response("204 No Content", [
-            ("Access-Control-Allow-Origin", "*"),
-            ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-            ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
-        ])
+    m = (environ.get("REQUEST_METHOD") or "GET").upper()
+    p = environ.get("PATH_INFO") or "/api/check-web"
+    hdrs_cors = [("Access-Control-Allow-Origin", "*"), ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"), ("Access-Control-Allow-Headers", "Content-Type, Authorization")]
+    if m == "OPTIONS":
+        start_response("204 No Content", hdrs_cors)
         return [b""]
-    if method == "GET":
-        body = json.dumps({
-            "service": "SecAudit PRO API",
-            "status": "online",
-            "version": "2.3",
-            "endpoint": path,
-        }, ensure_ascii=False).encode("utf-8")
-        start_response("200 OK", [
-            ("Content-Type", "application/json; charset=utf-8"),
-            ("Access-Control-Allow-Origin", "*"),
-            ("Content-Length", str(len(body))),
-        ])
-        return [body]
-    if method == "POST":
+    if m == "GET":
+        b = json.dumps({"service": "SecAudit PRO API", "status": "online", "version": "2.3", "endpoint": p}, ensure_ascii=False).encode("utf-8")
+        start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"), ("Access-Control-Allow-Origin", "*"), ("Content-Length", str(len(b)))])
+        return [b]
+    if m == "POST":
         try:
-            length = int(environ.get("CONTENT_LENGTH") or "0")
+            n = int(environ.get("CONTENT_LENGTH") or "0")
         except ValueError:
-            length = 0
-        raw_body = environ["wsgi.input"].read(length) if length > 0 else b"{}"
+            n = 0
+        raw = environ["wsgi.input"].read(n) if n > 0 else b"{}"
         try:
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
+            payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
-            body = json.dumps({"error": "JSON invalido no corpo da requisicao."}, ensure_ascii=False).encode("utf-8")
-            start_response("400 Bad Request", [
-                ("Content-Type", "application/json; charset=utf-8"),
-                ("Access-Control-Allow-Origin", "*"),
-                ("Content-Length", str(len(body))),
-            ])
-            return [body]
+            b = json.dumps({"error": "JSON invalido no corpo da requisicao."}, ensure_ascii=False).encode("utf-8")
+            start_response("400 Bad Request", [("Content-Type", "application/json; charset=utf-8"), ("Access-Control-Allow-Origin", "*"), ("Content-Length", str(len(b)))])
+            return [b]
         try:
-            status_code, response_body = run_audit(payload)
-        except Exception as exc:
-            status_code = 500
-            response_body = {"error": f"Erro interno na auditoria: {exc}", "type": type(exc).__name__}
-        status_map = {
-            200: "200 OK",
-            400: "400 Bad Request",
-            403: "403 Forbidden",
-            500: "500 Internal Server Error",
-            502: "502 Bad Gateway",
-        }
-        body = json.dumps(response_body, ensure_ascii=False).encode("utf-8")
-        start_response(status_map.get(status_code, f"{status_code} OK"), [
-            ("Content-Type", "application/json; charset=utf-8"),
-            ("Access-Control-Allow-Origin", "*"),
-            ("Content-Length", str(len(body))),
-        ])
-        return [body]
-    body = json.dumps({"error": "Metodo nao suportado."}, ensure_ascii=False).encode("utf-8")
-    start_response("405 Method Not Allowed", [
-        ("Content-Type", "application/json; charset=utf-8"),
-        ("Access-Control-Allow-Origin", "*"),
-        ("Content-Length", str(len(body))),
-    ])
-    return [body]
+            st, res = run_audit(payload)
+        except Exception as e:
+            st, res = 500, {"error": f"Erro interno na auditoria: {e}", "type": type(e).__name__}
+        smap = {200: "200 OK", 400: "400 Bad Request", 403: "403 Forbidden", 500: "500 Internal Server Error", 502: "502 Bad Gateway"}
+        b = json.dumps(res, ensure_ascii=False).encode("utf-8")
+        start_response(smap.get(st, f"{st} OK"), [("Content-Type", "application/json; charset=utf-8"), ("Access-Control-Allow-Origin", "*"), ("Content-Length", str(len(b)))])
+        return [b]
+    b = json.dumps({"error": "Metodo nao suportado."}, ensure_ascii=False).encode("utf-8")
+    start_response("405 Method Not Allowed", [("Content-Type", "application/json; charset=utf-8"), ("Access-Control-Allow-Origin", "*"), ("Content-Length", str(len(b)))])
+    return [b]
