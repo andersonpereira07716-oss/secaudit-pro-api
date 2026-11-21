@@ -1,0 +1,10 @@
+[
+  {
+    "target": "https://quack-emporio-patos-pb.surge.sh",
+    "client_name": "Quack Empório"
+  },
+  {
+    "target": "https://vila-sertao-patos.surge.sh",
+    "client_name": "Vila Sertão"
+  }
+]
