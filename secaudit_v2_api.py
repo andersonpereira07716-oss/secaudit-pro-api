@@ -31,6 +31,8 @@ _DNS_TYPE_MAP = {
     "MX": 15,
     "TXT": 16,
     "AAAA": 28,
+    "DS": 43,
+    "DNSKEY": 48,
     "CAA": 257,
 }
 
@@ -91,22 +93,25 @@ def _decode_dns_name(buf: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), next_offset
 
 
-def _query_udp_dns(host: str, rtype: str, server: str = "1.1.1.1") -> list[str]:
+def _query_udp_dns_full(host: str, rtype: str, server: str = "1.1.1.1") -> tuple[list[str], bool]:
     qtype = _DNS_TYPE_MAP.get(rtype.upper())
     if not qtype:
-        return []
+        return [], False
     txid = (sum(ord(ch) for ch in host) + qtype) & 0xFFFF
-    header = txid.to_bytes(2, "big") + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    # RD=1 (0x0100) + AD=1 (0x0020) -> 0x0120
+    header = txid.to_bytes(2, "big") + b"\x01\x20\x00\x01\x00\x00\x00\x00\x00\x00"
     question = _encode_dns_name(host) + qtype.to_bytes(2, "big") + (1).to_bytes(2, "big")
     packet = header + question
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(2.5)
         sock.sendto(packet, (server, 53))
-        resp, _ = sock.recvfrom(2048)
+        resp, _ = sock.recvfrom(4096)
 
     if len(resp) < 12:
-        return []
+        return [], False
+    flags = int.from_bytes(resp[2:4], "big")
+    ad_flag = bool(flags & 0x0020)
     qdcount = int.from_bytes(resp[4:6], "big")
     ancount = int.from_bytes(resp[6:8], "big")
     idx = 12
@@ -155,21 +160,25 @@ def _query_udp_dns(host: str, rtype: str, server: str = "1.1.1.1") -> list[str]:
             if joined:
                 results.append(joined)
         elif rtype_num == 257 and rdlen >= 2:
-            flags = rdata[0]
+            c_flags = rdata[0]
             tlen = rdata[1]
             tag = rdata[2:2 + tlen].decode("ascii", errors="ignore")
             val = rdata[2 + tlen:].decode("utf-8", errors="ignore")
-            results.append(f'{flags} {tag} "{val}"')
+            results.append(f'{c_flags} {tag} "{val}"')
+        elif rtype_num in (43, 48) and rdlen >= 4:
+            results.append(f"type={rtype_num} len={rdlen}")
 
-    return results
+    return results, ad_flag
 
 
-def _dig_records(host: str, rtype: str) -> list[str]:
+def _dig_records_meta(host: str, rtype: str) -> tuple[list[str], bool]:
+    ad_seen = False
     for srv in ("1.1.1.1", "8.8.8.8"):
         try:
-            records = _query_udp_dns(host, rtype, srv)
+            records, ad = _query_udp_dns_full(host, rtype, srv)
+            ad_seen = ad_seen or ad
             if records:
-                return records
+                return records, ad_seen
         except Exception:
             continue
     try:
@@ -178,20 +187,73 @@ def _dig_records(host: str, rtype: str) -> list[str]:
             url = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(host)}&type={qtype}"
             req = urllib.request.Request(
                 url,
-                headers={"Accept": "application/dns-json", "User-Agent": "SecAuditPRO/2.2"},
+                headers={"Accept": "application/dns-json", "User-Agent": "SecAuditPRO/2.3"},
             )
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+                ad_seen = ad_seen or bool(data.get("AD"))
                 out: list[str] = []
                 for ans in data.get("Answer") or []:
                     val = str(ans.get("data") or "").strip().strip('"')
                     if val:
                         out.append(val)
                 if out:
-                    return out
+                    return out, ad_seen
     except Exception:
         pass
-    return []
+    return [], ad_seen
+
+
+def _dig_records(host: str, rtype: str) -> list[str]:
+    recs, _ = _dig_records_meta(host, rtype)
+    return recs
+
+
+def _estimate_spf_lookups(spf_records: list[str]) -> int:
+    if not spf_records:
+        return 0
+    # Conta mecanismos DNS lookup (include:, a, mx, ptr, exists:, redirect=)
+    joined = " ".join(spf_records).lower()
+    lookups = 0
+    for token in joined.split():
+        cleaned = re.sub(r"^[+\-~?]", "", token)
+        if cleaned.startswith("include:") or cleaned.startswith("exists:") or cleaned.startswith("redirect="):
+            lookups += 1
+        elif cleaned == "a" or cleaned.startswith("a:") or cleaned.startswith("a/"):
+            lookups += 1
+        elif cleaned == "mx" or cleaned.startswith("mx:") or cleaned.startswith("mx/"):
+            lookups += 1
+        elif cleaned == "ptr" or cleaned.startswith("ptr:"):
+            lookups += 1
+    return lookups
+
+
+def _check_mta_sts(base_domain: str) -> dict:
+    sts_txt_records = _dig_records(f"_mta-sts.{base_domain}", "TXT")
+    has_sts_dns = any("v=stsv1" in r.lower() for r in sts_txt_records)
+    policy_found = False
+    policy_mode = None
+    if has_sts_dns:
+        policy_url = f"https://mta-sts.{base_domain}/.well-known/mta-sts.txt"
+        try:
+            req = urllib.request.Request(policy_url, headers={"User-Agent": "SecAuditPRO/2.3"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                if getattr(resp, "status", 200) == 200:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    if "version: stsv1" in body.lower():
+                        policy_found = True
+                        m = re.search(r"^\s*mode\s*:\s*([a-zA-Z]+)", body, re.MULTILINE | re.IGNORECASE)
+                        if m:
+                            policy_mode = m.group(1).lower()
+        except Exception:
+            policy_found = False
+
+    return {
+        "has_dns_record": has_sts_dns,
+        "dns_records": sts_txt_records[:3],
+        "policy_accessible": policy_found,
+        "mode": policy_mode,
+    }
 
 
 def _check_dns_and_email(host: str) -> dict:
@@ -216,15 +278,17 @@ def _check_dns_and_email(host: str) -> dict:
     if not aaaa_records:
         aaaa_records = _dig_records(host, "AAAA")
 
-    mx_records = _dig_records(base_domain, "MX")
-    ns_records = _dig_records(base_domain, "NS")
+    mx_records, ad_mx = _dig_records_meta(base_domain, "MX")
+    ns_records, ad_ns = _dig_records_meta(base_domain, "NS")
     caa_records = _dig_records(base_domain, "CAA")
     txt_records = _dig_records(base_domain, "TXT")
     dmarc_records = _dig_records(f"_dmarc.{base_domain}", "TXT")
+    dnskey_records, _ = _dig_records_meta(base_domain, "DNSKEY")
 
     spf_records = [t for t in txt_records if "v=spf1" in t.lower()]
     has_spf = len(spf_records) > 0
     spf_strict = any(re.search(r"[-~]all\b", s.lower()) for s in spf_records)
+    spf_lookups = _estimate_spf_lookups(spf_records)
 
     dmarc_valid = [d for d in dmarc_records if "v=dmarc1" in d.lower()]
     has_dmarc = len(dmarc_valid) > 0
@@ -242,6 +306,8 @@ def _check_dns_and_email(host: str) -> dict:
         if any("v=dkim1" in t.lower() or "p=" in t.lower() for t in txts) or cnames:
             dkim_found.append(sel)
 
+    dnssec_enabled = bool(ad_mx or ad_ns or dnskey_records)
+    mta_sts = _check_mta_sts(base_domain)
     has_caa = len(caa_records) > 0
 
     return {
@@ -254,13 +320,27 @@ def _check_dns_and_email(host: str) -> dict:
         "spf": spf_records[:3],
         "dmarc": dmarc_valid[:3],
         "dkim_selectors": dkim_found,
+        "mta_sts": mta_sts,
         "has_spf": has_spf,
         "spf_strict": spf_strict,
+        "spf_lookups": spf_lookups,
         "has_dmarc": has_dmarc,
         "dmarc_policy": dmarc_policy,
         "has_dkim": len(dkim_found) > 0,
         "has_caa": has_caa,
+        "dnssec_enabled": dnssec_enabled,
     }
+
+
+def _parse_csp_directives(csp_val: str) -> dict[str, list[str]]:
+    directives: dict[str, list[str]] = {}
+    for raw_dir in (csp_val or "").split(";"):
+        tokens = [t.strip() for t in raw_dir.strip().split() if t.strip()]
+        if not tokens:
+            continue
+        name = tokens[0].lower()
+        directives[name] = [t.lower() for t in tokens[1:]]
+    return directives
 
 
 def _probe_tls_version(host: str, port: int, tls_ver) -> bool:
@@ -342,7 +422,7 @@ def _check_http_redirect(host: str) -> bool:
             return None
 
     opener = urllib.request.build_opener(NoRedirect())
-    req = urllib.request.Request(f"http://{host}/", headers={"User-Agent": "SecAuditPRO/2.2"})
+    req = urllib.request.Request(f"http://{host}/", headers={"User-Agent": "SecAuditPRO/2.3"})
     try:
         with opener.open(req, timeout=5) as resp:
             loc = (resp.headers.get("Location") or "").lower()
@@ -355,7 +435,7 @@ def _check_http_redirect(host: str) -> bool:
 
 
 def _fetch_target_headers(url: str) -> tuple[int, dict[str, str], list[str]]:
-    req = urllib.request.Request(url, headers={"User-Agent": "SecAuditPRO/2.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "SecAuditPRO/2.3"})
     set_cookies: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=7) as resp:
@@ -464,23 +544,41 @@ def run_audit(payload: dict) -> tuple[int, dict]:
 
     # Qualidade do HSTS
     hsts_val = headers.get("strict-transport-security", "")
+    hsts_meta = {"present": bool(hsts_val), "max_age": None, "include_subdomains": False, "preload": False}
     if hsts_val:
+        hsts_low = hsts_val.lower()
+        hsts_meta["include_subdomains"] = "includesubdomains" in hsts_low
+        hsts_meta["preload"] = "preload" in hsts_low
         m_age = re.search(r"max-age\s*=\s*(\d+)", hsts_val, re.IGNORECASE)
-        if m_age and int(m_age.group(1)) < 15552000:
-            web_findings.append({
-                "category": "HEADERS",
-                "title": f"HSTS com max-age curto ({m_age.group(1)}s)",
-                "severity": "BAIXO",
-                "action": "Aumente max-age para pelo menos 15552000 (180 dias) ou 31536000 (1 ano).",
-            })
-        elif m_age:
-            passed_checks.append("HSTS configurado com max-age robusto")
+        if m_age:
+            age_sec = int(m_age.group(1))
+            hsts_meta["max_age"] = age_sec
+            if age_sec < 15552000:
+                web_findings.append({
+                    "category": "HEADERS",
+                    "title": f"HSTS com max-age curto ({age_sec}s)",
+                    "severity": "BAIXO",
+                    "action": "Aumente max-age para pelo menos 15552000 (180 dias) ou 31536000 (1 ano).",
+                })
+            else:
+                passed_checks.append("HSTS configurado com max-age robusto")
 
-    # Qualidade do CSP
+    # Analise profunda do CSP
     csp_val = headers.get("content-security-policy", "")
+    csp_analysis = {
+        "present": bool(csp_val),
+        "directives_count": 0,
+        "has_unsafe_inline_or_eval": False,
+        "has_wildcard_script_or_default": False,
+        "has_object_src_none": False,
+        "has_frame_ancestors": False,
+    }
     if csp_val:
+        dirs = _parse_csp_directives(csp_val)
+        csp_analysis["directives_count"] = len(dirs)
         csp_low = csp_val.lower()
         if "'unsafe-inline'" in csp_low or "'unsafe-eval'" in csp_low:
+            csp_analysis["has_unsafe_inline_or_eval"] = True
             web_findings.append({
                 "category": "HEADERS",
                 "title": "Content-Security-Policy permite unsafe-inline ou unsafe-eval",
@@ -489,6 +587,40 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             })
         else:
             passed_checks.append("CSP sem diretivas unsafe-inline/unsafe-eval")
+
+        script_tokens = dirs.get("script-src") or dirs.get("default-src") or []
+        if "*" in script_tokens or "data:" in script_tokens:
+            csp_analysis["has_wildcard_script_or_default"] = True
+            web_findings.append({
+                "category": "HEADERS",
+                "title": "CSP com fonte ampla (* ou data:) em script-src/default-src",
+                "severity": "MEDIO",
+                "action": "Restrinja origens de scripts a dominios confiaveis ou nonces.",
+            })
+
+        obj_tokens = dirs.get("object-src") or []
+        if "'none'" in obj_tokens:
+            csp_analysis["has_object_src_none"] = True
+            passed_checks.append("CSP bloqueia plugins via object-src 'none'")
+        elif "object-src" not in dirs and "'none'" not in (dirs.get("default-src") or []):
+            web_findings.append({
+                "category": "HEADERS",
+                "title": "CSP sem object-src 'none' explicito",
+                "severity": "BAIXO",
+                "action": "Adicione object-src 'none' na politica CSP para mitigar execucao de objetos legados.",
+            })
+
+        if "frame-ancestors" in dirs:
+            csp_analysis["has_frame_ancestors"] = True
+            passed_checks.append("CSP define frame-ancestors contra clickjacking")
+
+    # Headers modernos de isolamento cross-origin (COOP / CORP)
+    coop_val = (headers.get("cross-origin-opener-policy") or "").strip()
+    corp_val = (headers.get("cross-origin-resource-policy") or "").strip()
+    if coop_val:
+        passed_checks.append(f"Cabecalho Cross-Origin-Opener-Policy presente ({coop_val})")
+    if corp_val:
+        passed_checks.append(f"Cabecalho Cross-Origin-Resource-Policy presente ({corp_val})")
 
     server_banner = headers.get("server", "")
     if re.search(r"[/]\s*\d+(\.\d+)+", server_banner):
@@ -542,10 +674,25 @@ def run_audit(payload: dict) -> tuple[int, dict]:
                 "action": f"Defina SameSite=Lax ou SameSite=Strict no cookie {c_name} contra CSRF.",
             })
 
-    # 3. DNS & Postura de E-mail
+    # 3. DNS & Postura de E-mail (SPF lookups, DNSSEC, MTA-STS)
     dns_info = _check_dns_and_email(host)
     if dns_info.get("has_spf"):
-        passed_checks.append("Registro SPF configurado no dominio")
+        lookups = dns_info.get("spf_lookups", 0)
+        passed_checks.append(f"Registro SPF configurado ({lookups} DNS lookup(s) estimados)")
+        if lookups > 10:
+            dns_findings.append({
+                "category": "DNS",
+                "title": f"SPF excede limite de 10 DNS lookups ({lookups} estimados)",
+                "severity": "MEDIO",
+                "action": "Consolide includes ou aplique flattening no registro SPF para evitar PermError.",
+            })
+        elif lookups >= 8:
+            dns_findings.append({
+                "category": "DNS",
+                "title": f"SPF proximo do limite de 10 DNS lookups ({lookups} estimados)",
+                "severity": "BAIXO",
+                "action": "Monitore os includes do SPF para nao ultrapassar 10 consultas DNS.",
+            })
         if not dns_info.get("spf_strict"):
             dns_findings.append({
                 "category": "DNS",
@@ -586,12 +733,40 @@ def run_audit(payload: dict) -> tuple[int, dict]:
     if dns_info.get("has_caa"):
         passed_checks.append("Registro CAA configurado para emissao de certificados")
 
+    if dns_info.get("dnssec_enabled"):
+        passed_checks.append("DNSSEC autenticado no dominio")
+    else:
+        dns_findings.append({
+            "category": "DNS",
+            "title": f"DNSSEC nao autenticado em {dns_info.get('domain')}",
+            "severity": "BAIXO",
+            "action": "Habilite DNSSEC no registrador/DNS para proteger a integridade das respostas DNS.",
+        })
+
+    mta_sts = dns_info.get("mta_sts") or {}
+    if mta_sts.get("has_dns_record") and mta_sts.get("policy_accessible"):
+        passed_checks.append(f"MTA-STS ativo (modo: {mta_sts.get('mode') or 'detectado'})")
+    elif mta_sts.get("has_dns_record"):
+        dns_findings.append({
+            "category": "DNS",
+            "title": "Registro _mta-sts presente, mas politica /.well-known/mta-sts.txt inacessivel",
+            "severity": "BAIXO",
+            "action": "Publique o arquivo mta-sts.txt em https://mta-sts.<dominio>/.well-known/mta-sts.txt.",
+        })
+    elif dns_info.get("mx"):
+        dns_findings.append({
+            "category": "DNS",
+            "title": "MTA-STS nao configurado para dominio com registros MX",
+            "severity": "BAIXO",
+            "action": "Configure _mta-sts e a politica mta-sts.txt para exigir TLS na entrega de e-mails.",
+        })
+
     findings = tls_findings + web_findings + dns_findings
     total_penalty = sum(SEVERITY_PENALTY.get(f.get("severity", "MEDIO"), 6) for f in findings)
     score = max(0, min(100, 100 - total_penalty))
 
     result = {
-        "version": "2.2",
+        "version": "2.3",
         "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "client_name": client_name,
         "target": target_url,
@@ -604,6 +779,8 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             "headers_cookies": _calc_subscore(web_findings),
             "dns_email": _calc_subscore(dns_findings),
         },
+        "hsts": hsts_meta,
+        "csp_analysis": csp_analysis,
         "tls": tls_info,
         "dns": dns_info,
         "findings": findings,
@@ -636,7 +813,7 @@ class handler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "service": "SecAudit PRO API",
             "status": "online",
-            "version": "2.2",
+            "version": "2.3",
             "endpoint": path or "/api/check-web",
         })
 
@@ -671,7 +848,7 @@ def app(environ, start_response):
         body = json.dumps({
             "service": "SecAudit PRO API",
             "status": "online",
-            "version": "2.2",
+            "version": "2.3",
             "endpoint": path,
         }, ensure_ascii=False).encode("utf-8")
         start_response("200 OK", [
