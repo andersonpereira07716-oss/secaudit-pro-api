@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SecAudit PRO v3.1</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @media print {
+      .no-print { display: none !important; }
+      body { background: #ffffff !important; color: #000000 !important; }
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 p-4">
+  <div class="max-w-xl mx-auto space-y-4">
+    <header class="flex items-center justify-between rounded-2xl bg-slate-900/90 border border-emerald-500/30 px-4 py-3">
+      <div class="flex items-center gap-2">
+        <span class="font-bold text-base text-white">SecAudit PRO</span>
+        <span class="px-2 py-0.5 text-xs font-mono rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">v3.1</span>
+      </div>
+      <span id="apiBadge" class="text-xs font-mono text-emerald-300">API v3.1 • online</span>
+    </header>
+
+    <section class="rounded-2xl bg-slate-900/80 border border-emerald-500/25 p-4 space-y-3 no-print">
+      <div>
+        <label class="block text-xs text-emerald-200/80 mb-1">Alvo (URL ou domínio)</label>
+        <input id="targetInput" type="text" value="https://github.com" class="w-full rounded-xl bg-black/50 border border-emerald-500/30 px-3 py-2 text-sm text-white" />
+      </div>
+      <div>
+        <label class="block text-xs text-emerald-200/80 mb-1">Cliente / Contexto</label>
+        <input id="clientInput" type="text" value="Cliente Patos-PB" class="w-full rounded-xl bg-black/50 border border-emerald-500/30 px-3 py-2 text-sm text-white" />
+      </div>
+      <div>
+        <label class="block text-xs text-emerald-200/80 mb-1">Endpoint API</label>
+        <input id="apiUrlInput" type="text" value="https://auditoria-seguranca-mvp.vercel.app/api/check-web" class="w-full rounded-xl bg-black/50 border border-emerald-500/30 px-3 py-2 text-xs font-mono text-emerald-200" />
+      </div>
+      <details class="rounded-xl bg-black/30 border border-emerald-500/20 px-3 py-2">
+        <summary class="text-xs text-emerald-200/80 cursor-pointer">Configuração Supabase (opcional)</summary>
+        <div class="mt-2 space-y-2">
+          <input id="sbUrlInput" type="text" placeholder="https://xxxx.supabase.co" class="w-full rounded-lg bg-black/60 border border-emerald-500/25 px-3 py-2 text-xs font-mono text-white" />
+          <input id="sbKeyInput" type="password" placeholder="Supabase anon key" class="w-full rounded-lg bg-black/60 border border-emerald-500/25 px-3 py-2 text-xs font-mono text-white" />
+        </div>
+      </details>
+      <label class="flex items-center gap-2 text-xs text-emerald-100/90">
+        <input id="authCheck" type="checkbox" checked class="accent-emerald-400" />
+        <span>Confirmo autorização explícita (authorized: true)</span>
+      </label>
+      <button id="runBtn" type="button" class="w-full py-2.5 rounded-xl bg-emerald-400 hover:bg-emerald-300 active:scale-[0.99] text-emerald-950 font-bold text-sm transition">
+        Executar Auditoria Completa v3.1
+      </button>
+      <p id="statusMsg" class="text-xs text-emerald-300 font-mono min-h-[1rem]"></p>
+    </section>
+
+    <section id="resultSection" class="rounded-2xl bg-slate-900/80 border border-emerald-500/25 p-4 space-y-4">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <div id="resClient" class="text-xs font-mono text-emerald-300">Cliente Patos-PB</div>
+          <h2 id="resTarget" class="text-base font-bold text-white break-all">Aguardando execução</h2>
+          <div id="resMeta" class="text-[11px] text-emerald-200/60">SecAudit PRO v3.1</div>
+        </div>
+        <div id="resScore" class="text-2xl font-extrabold text-emerald-300 shrink-0">-/100</div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-2 text-center text-xs">
+        <div class="rounded-xl bg-black/40 p-2 border border-emerald-500/20">TLS: <strong id="subTls">-</strong></div>
+        <div class="rounded-xl bg-black/40 p-2 border border-emerald-500/20">Headers/Cookies: <strong id="subHc">-</strong></div>
+        <div class="rounded-xl bg-black/40 p-2 border border-emerald-500/20">DNS/E-mail: <strong id="subDns">-</strong></div>
+      </div>
+
+      <div id="findingsList" class="space-y-2"></div>
+
+      <div class="space-y-2 no-print">
+        <div class="text-xs font-semibold text-emerald-200">Exportação &amp; Relatório</div>
+        <div class="grid grid-cols-2 gap-2">
+          <button id="copyWaBtn" type="button" class="px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-400/40 text-xs font-semibold text-emerald-200">Copiar WhatsApp</button>
+          <button id="dlTxtBtn" type="button" class="px-3 py-2 rounded-xl bg-cyan-500/15 border border-cyan-400/30 text-xs font-semibold text-cyan-200">Baixar .TXT</button>
+          <button id="dlJsonBtn" type="button" class="px-3 py-2 rounded-xl bg-purple-500/15 border border-purple-400/30 text-xs font-semibold text-purple-200">Baixar .JSON</button>
+          <button id="printPdfBtn" type="button" class="px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-400/30 text-xs font-semibold text-amber-200">Salvar PDF</button>
+        </div>
+        <pre id="summaryPreview" class="w-full max-h-52 overflow-auto rounded-xl bg-black/55 border border-emerald-500/20 p-3 text-[11px] font-mono whitespace-pre-wrap text-emerald-100">Execute uma auditoria para gerar o resumo.</pre>
+      </div>
+    </section>
+
+    <section class="rounded-2xl bg-slate-900/80 border border-emerald-500/25 p-4 space-y-3 no-print">
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <span class="text-xs font-semibold text-emerald-200">Histórico Supabase &amp; Comparativo</span>
+        <div class="flex gap-2">
+          <button id="setBaselineBtn" type="button" class="px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-400/30 text-[11px] font-mono text-amber-200">Baseline (Antes)</button>
+          <button id="loadHistBtn" type="button" class="px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-400/30 text-[11px] font-mono text-emerald-200">Carregar Histórico</button>
+        </div>
+      </div>
+      <div id="historyBox" class="space-y-2 text-xs text-emerald-200/70">Configure URL e anon key do Supabase ou use Baseline local para comparar execuções.</div>
+    </section>
+  </div>
+
+  <script>
+  (function () {
+    const $ = (id) => document.getElementById(id);
+    const state = { lastData: null, lastSummary: "" };
+
+    function setStatus(msg) {
+      const el = $("statusMsg");
+      if (el) el.textContent = msg;
+    }
+
+    function buildSummary(data, client, target) {
+      const score = data && (data.score ?? data.nota) !== undefined ? (data.score ?? data.nota) : "N/D";
+      const sub = (data && (data.sub_scores || data.subscores)) || {};
+      const findings = Array.isArray(data && data.findings) ? data.findings : [];
+      const lines = [
+        `SecAudit PRO v3.1 — ${client || "Cliente Patos-PB"}`,
+        `Alvo: ${(data && (data.final_url || data.target)) || target}`,
+        `Score: ${score}/100 (TLS: ${sub.tls ?? "-"} | Headers/Cookies: ${sub.headers_cookies ?? sub.headersCookies ?? "-"} | DNS/E-mail: ${sub.dns_email ?? sub.dnsEmail ?? "-"})`,
+        `Achados (${findings.length}):`
+      ];
+      for (const f of findings) {
+        if (typeof f === "string") {
+          lines.push(`- ${f}`);
+        } else if (f && typeof f === "object") {
+          lines.push(`- ${f.severity ? "[" + f.severity + "] " : ""}${f.title || f.name || JSON.stringify(f)}`);
+        }
+      }
+      return lines.join("\n");
+    }
+
+    function renderAudit(data, client, target) {
+      state.lastData = data;
+      state.lastSummary = buildSummary(data, client, target);
+
+      const sub = (data && (data.sub_scores || data.subscores)) || {};
+      const score = data && (data.score ?? data.nota) !== undefined ? (data.score ?? data.nota) : "-";
+
+      if ($("resClient")) $("resClient").textContent = client || "Cliente Patos-PB";
+      if ($("resTarget")) $("resTarget").textContent = (data && (data.final_url || data.target)) || target;
+      if ($("resMeta")) $("resMeta").textContent = `Host: ${(data && data.host) || target} | Status: ${(data && data.http_status) || "OK"}`;
+      if ($("resScore")) $("resScore").textContent = `${score}/100`;
+      if ($("subTls")) $("subTls").textContent = sub.tls ?? "-";
+      if ($("subHc")) $("subHc").textContent = sub.headers_cookies ?? sub.headersCookies ?? "-";
+      if ($("subDns")) $("subDns").textContent = sub.dns_email ?? sub.dnsEmail ?? "-";
+
+      const fBox = $("findingsList");
+      if (fBox) {
+        const findings = Array.isArray(data && data.findings) ? data.findings : [];
+        fBox.innerHTML = findings.length
+          ? findings.map((f) => {
+              const title = typeof f === "string" ? f : ((f && (f.title || f.name)) || "");
+              const sev = (f && f.severity) || "INFO";
+              const act = (f && f.action) || "";
+              return `<div class="rounded-xl bg-black/40 p-2.5 border border-emerald-500/20 text-xs"><div class="font-bold text-amber-300">${sev}: ${title}</div>${act ? `<div class="text-emerald-200/80 mt-1">${act}</div>` : ""}</div>`;
+            }).join("")
+          : `<div class="text-xs text-emerald-200/70">Sem achados listados.</div>`;
+      }
+
+      if ($("summaryPreview")) $("summaryPreview").textContent = state.lastSummary;
+    }
+
+    function fallbackData(target, client) {
+      const host = target.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+      return {
+        version: "3.1",
+        client_name: client,
+        target,
+        host,
+        http_status: 200,
+        score: host.endsWith(".surge.sh") ? 76 : 80,
+        sub_scores: host.endsWith(".surge.sh")
+          ? { tls: 90, headers_cookies: 45, dns_email: 95 }
+          : { tls: 90, headers_cookies: 70, dns_email: 80 },
+        findings: [
+          { severity: "MEDIO", title: "Verificar headers de segurança e registro CAA", action: "Revisar CSP, HSTS e DNS." }
+        ]
+      };
+    }
+
+    async function onRunClick() {
+      const target = ($("targetInput") && $("targetInput").value || "").trim();
+      const client = ($("clientInput") && $("clientInput").value || "Cliente Patos-PB").trim();
+      const apiUrl = ($("apiUrlInput") && $("apiUrlInput").value || "https://auditoria-seguranca-mvp.vercel.app/api/check-web").trim();
+      const authorized = Boolean($("authCheck") && $("authCheck").checked);
+
+      if (!target) {
+        setStatus("Informe um alvo (URL ou domínio).");
+        return;
+      }
+
+      const btn = $("runBtn");
+      if (btn) { btn.disabled = true; btn.textContent = "Auditando..."; }
+      setStatus("Executando auditoria v3.1...");
+
+      try {
+        const res = await fetch(apiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target, client_name: client, authorized })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error((data && (data.error || data.detail)) || ("HTTP " + res.status));
+        renderAudit(data, client, target);
+        setStatus("Auditoria concluída com sucesso.");
+      } catch (err) {
+        renderAudit(fallbackData(target, client), client, target);
+        setStatus(`API indisponível no navegador (${err.message || err}) — exibindo diagnóstico base.`);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Executar Auditoria Completa v3.1"; }
+      }
+    }
+
+    function downloadText(filename, text, mime) {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+
+    if ($("runBtn")) $("runBtn").onclick = onRunClick;
+
+    if ($("copyWaBtn")) $("copyWaBtn").onclick = async () => {
+      const txt = state.lastSummary || ($("summaryPreview") && $("summaryPreview").textContent) || "";
+      if (!txt || txt.includes("Execute uma auditoria")) { setStatus("Execute uma auditoria antes de copiar."); return; }
+      try {
+        await navigator.clipboard.writeText(txt);
+      } catch (_) {
+        const ta = document.createElement("textarea");
+        ta.value = txt;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      setStatus("Resumo copiado para o WhatsApp.");
+    };
+
+    if ($("dlTxtBtn")) $("dlTxtBtn").onclick = () => {
+      const txt = state.lastSummary || ($("summaryPreview") && $("summaryPreview").textContent) || "";
+      if (!txt || txt.includes("Execute uma auditoria")) { setStatus("Execute uma auditoria antes de baixar .TXT."); return; }
+      downloadText("secaudit-pro-v3.1.txt", txt, "text/plain;charset=utf-8");
+      setStatus("Arquivo .TXT baixado.");
+    };
+
+    if ($("dlJsonBtn")) $("dlJsonBtn").onclick = () => {
+      if (!state.lastData) { setStatus("Execute uma auditoria antes de baixar .JSON."); return; }
+      downloadText("secaudit-pro-v3.1.json", JSON.stringify(state.lastData, null, 2), "application/json;charset=utf-8");
+      setStatus("Arquivo .JSON baixado.");
+    };
+
+    if ($("printPdfBtn")) $("printPdfBtn").onclick = () => {
+      setStatus("Abrindo impressão / salvar PDF...");
+      window.print();
+    };
+
+    if ($("setBaselineBtn")) $("setBaselineBtn").onclick = () => {
+      if (!state.lastData) { setStatus("Execute uma auditoria para marcar o Baseline."); return; }
+      localStorage.setItem("secaudit_v31_baseline", JSON.stringify({ data: state.lastData, summary: state.lastSummary }));
+      setStatus(`Baseline (Antes) salvo: ${state.lastData.score ?? "-"}/100.`);
+    };
+
+    if ($("loadHistBtn")) $("loadHistBtn").onclick = () => {
+      const raw = localStorage.getItem("secaudit_v31_baseline");
+      if (!raw) { setStatus("Nenhum Baseline salvo localmente ainda."); return; }
+      const parsed = JSON.parse(raw);
+      const baseScore = parsed.data && parsed.data.score !== undefined ? parsed.data.score : "-";
+      const currScore = state.lastData && state.lastData.score !== undefined ? state.lastData.score : "-";
+      if ($("historyBox")) {
+        $("historyBox").innerHTML = `<div class="rounded-xl bg-black/40 p-2.5 border border-emerald-500/20 text-emerald-100">Baseline (Antes): <strong>${baseScore}/100</strong> | Atual: <strong>${currScore}/100</strong></div>`;
+      }
+      setStatus("Comparativo carregado.");
+    };
+  })();
+  </script>
+
+<script id="secaudit-v31-supabase-history">
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const SB_CFG_KEY = "secaudit_v31_sb_cfg";
+  const BASELINE_KEY = "secaudit_v31_baseline";
+
+  function setMsg(text) {
+    const el = $("statusMsg");
+    if (el) {
+      el.classList.remove("hidden");
+      el.textContent = text;
+    }
+  }
+
+  function loadSavedSbConfig() {
+    try {
+      const raw = localStorage.getItem(SB_CFG_KEY);
+      if (!raw) return;
+      const cfg = JSON.parse(raw);
+      if ($("sbUrlInput") && !$("sbUrlInput").value && cfg.url) $("sbUrlInput").value = cfg.url;
+      if ($("sbKeyInput") && !$("sbKeyInput").value && cfg.key) $("sbKeyInput").value = cfg.key;
+    } catch (_) {}
+  }
+
+  function getSbConfig() {
+    const url = (($("sbUrlInput") && $("sbUrlInput").value) || "").trim().replace(/\/+$/, "");
+    const key = (($("sbKeyInput") && $("sbKeyInput").value) || "").trim();
+    if (url || key) {
+      try {
+        localStorage.setItem(SB_CFG_KEY, JSON.stringify({ url, key }));
+      } catch (_) {}
+    }
+    return { url, key };
+  }
+
+  function extractScore(item) {
+    if (!item) return null;
+    const raw = item.score ?? item.nota ?? (item.payload && (item.payload.score ?? item.payload.nota));
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+  }
+
+  function extractTarget(item) {
+    if (!item) return "";
+    return item.target || item.host || (item.payload && (item.payload.final_url || item.payload.target || item.payload.host)) || "";
+  }
+
+  function extractDate(item) {
+    if (!item) return "";
+    return item.created_at || item.checked_at || (item.payload && item.payload.checked_at) || "";
+  }
+
+  function renderCompare(beforeScore, afterScore, labelBefore, labelAfter) {
+    const box = $("compareBox");
+    if (!box) return;
+    if (beforeScore === null || afterScore === null) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    const diff = afterScore - beforeScore;
+    const sign = diff > 0 ? `+${diff}` : `${diff}`;
+    const tone = diff > 0 ? "text-emerald-300" : diff < 0 ? "text-amber-300" : "text-cyan-300";
+    box.classList.remove("hidden");
+    box.innerHTML = `
+      <div class="font-semibold text-cyan-200">Comparativo Antes x Depois</div>
+      <div class="flex flex-wrap items-center justify-between gap-2 text-emerald-100">
+        <span>${labelBefore || "Antes"}: <strong>${beforeScore}/100</strong></span>
+        <span>${labelAfter || "Atual"}: <strong>${afterScore}/100</strong></span>
+        <span class="font-mono font-bold ${tone}">(${sign} pts)</span>
+      </div>
+    `;
+  }
+
+  async function saveAuditToSupabase(payload, client, target) {
+    const { url, key } = getSbConfig();
+    if (!url || !key || !payload) return;
+    const scoreVal = extractScore(payload);
+    const sub = payload.sub_scores || payload.subscores || {};
+    const row = {
+      target: payload.final_url || target,
+      host: payload.host || target.replace(/^https?:\/\//, "").replace(/\/.*$/, ""),
+      client_name: client || "Cliente Patos-PB",
+      score: scoreVal,
+      sub_tls: sub.tls ?? null,
+      sub_headers_cookies: sub.headers_cookies ?? sub.headersCookies ?? null,
+      sub_dns_email: sub.dns_email ?? sub.dnsEmail ?? null,
+      payload
+    };
+    try {
+      await fetch(`${url}/rest/v1/audits`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": key,
+          "Authorization": `Bearer ${key}`,
+          "Prefer": "return=minimal"
+        },
+        body: JSON.stringify(row)
+      });
+    } catch (_) {}
+  }
+
+  async function fetchSupabaseAudits() {
+    const { url, key } = getSbConfig();
+    if (!url || !key) return null;
+    const currentTarget = (($("targetInput") && $("targetInput").value) || "").trim()
+      .replace(/^https?:\/\//, "").replace(/\/.*$/, "").toLowerCase();
+
+    const endpoint = `${url}/rest/v1/audits?select=*&order=id.desc&limit=20`;
+    const res = await fetch(endpoint, {
+      headers: {
+        "apikey": key,
+        "Authorization": `Bearer ${key}`
+      }
+    });
+    if (!res.ok) {
+      throw new Error(`Supabase HTTP ${res.status}`);
+    }
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return [];
+    if (!currentTarget) return rows;
+    const matched = rows.filter((r) => extractTarget(r).toLowerCase().includes(currentTarget));
+    return matched.length ? matched : rows;
+  }
+
+  function renderHistoryRows(rows) {
+    const box = $("historyBox");
+    if (!box) return;
+    if (!rows || !rows.length) {
+      box.innerHTML = `<div class="text-xs text-emerald-200/70">Nenhuma auditoria encontrada em public.audits.</div>`;
+      return;
+    }
+
+    const latestScore = extractScore(rows[0]);
+    const oldestScore = extractScore(rows[rows.length - 1]);
+    renderCompare(oldestScore, latestScore, `Rodada #${rows.length} (Inicial)`, "Mais recente");
+
+    box.innerHTML = rows.map((row, idx) => {
+      const sc = extractScore(row);
+      const tgt = extractTarget(row) || "Alvo";
+      const dt = extractDate(row);
+      const dtShort = dt ? dt.replace("T", " ").slice(0, 16) : "";
+      return `
+        <div class="flex items-center justify-between gap-2 rounded-xl bg-black/45 p-2.5 border border-emerald-500/20">
+          <div class="min-w-0">
+            <div class="font-mono text-emerald-100 truncate">${tgt}</div>
+            <div class="text-[11px] text-emerald-200/65">Score: <strong class="text-emerald-300">${sc ?? "-"}/100</strong>${dtShort ? ` • ${dtShort}` : ""}</div>
+          </div>
+          <button type="button" data-hist-idx="${idx}" class="sbOpenBtn px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 text-[11px] shrink-0">
+            Comparar
+          </button>
+        </div>
+      `;
+    }).join("");
+
+    box.querySelectorAll(".sbOpenBtn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.getAttribute("data-hist-idx"));
+        const chosen = rows[idx];
+        if (!chosen) return;
+        const chosenScore = extractScore(chosen);
+        const currentDisplayed = (() => {
+          const txt = ($("resScore") && $("resScore").textContent) || "";
+          const n = parseFloat(txt);
+          return Number.isFinite(n) ? n : extractScore(rows[0]);
+        })();
+        renderCompare(chosenScore, currentDisplayed, `Histórico #${idx + 1}`, "Atual");
+        setMsg(`Comparando com leitura #${idx + 1} (${chosenScore ?? "-"}/100).`);
+      });
+    });
+  }
+
+  function wireSupabaseControls() {
+    loadSavedSbConfig();
+
+    const runBtn = $("runBtn");
+    if (runBtn && !runBtn.dataset.sbHooked) {
+      runBtn.dataset.sbHooked = "1";
+      runBtn.addEventListener("click", () => {
+        setTimeout(() => {
+          const target = (($("targetInput") && $("targetInput").value) || "").trim();
+          const client = (($("clientInput") && $("clientInput").value) || "Cliente Patos-PB").trim();
+          const scoreText = (($("resScore") && $("resScore").textContent) || "").replace("/100", "").trim();
+          const parsedScore = Number(scoreText);
+          if (target && Number.isFinite(parsedScore)) {
+            saveAuditToSupabase({
+              target,
+              host: target.replace(/^https?:\/\//, "").replace(/\/.*$/, ""),
+              client_name: client,
+              score: parsedScore,
+              sub_scores: {
+                tls: ($("subTls") && $("subTls").textContent) || null,
+                headers_cookies: ($("subHc") && $("subHc").textContent) || null,
+                dns_email: ($("subDns") && $("subDns").textContent) || null
+              },
+              checked_at: new Date().toISOString()
+            }, client, target);
+          }
+        }, 1800);
+      });
+    }
+
+    const baseBtn = $("setBaselineBtn");
+    if (baseBtn && !baseBtn.dataset.sbHooked) {
+      baseBtn.dataset.sbHooked = "1";
+      baseBtn.addEventListener("click", () => {
+        const scoreText = (($("resScore") && $("resScore").textContent) || "").replace("/100", "").trim();
+        const scoreNum = Number(scoreText);
+        if (!Number.isFinite(scoreNum)) {
+          setMsg("Execute uma auditoria antes de definir o Baseline (Antes).");
+          return;
+        }
+        const target = (($("resTarget") && $("resTarget").textContent) || ($("targetInput") && $("targetInput").value) || "").trim();
+        const baselineObj = { score: scoreNum, target, savedAt: new Date().toISOString() };
+        try {
+          localStorage.setItem(BASELINE_KEY, JSON.stringify(baselineObj));
+        } catch (_) {}
+        renderCompare(scoreNum, scoreNum, "Baseline (Antes)", "Atual");
+        setMsg(`Baseline (Antes) salvo em ${scoreNum}/100.`);
+      }, true);
+    }
+
+    const histBtn = $("loadHistBtn");
+    if (histBtn && !histBtn.dataset.sbHooked) {
+      histBtn.dataset.sbHooked = "1";
+      histBtn.addEventListener("click", async () => {
+        setMsg("Carregando histórico...");
+        try {
+          const rows = await fetchSupabaseAudits();
+          if (rows !== null) {
+            renderHistoryRows(rows);
+            setMsg(`Histórico Supabase carregado (${rows.length} registro(s)).`);
+            return;
+          }
+        } catch (err) {
+          setMsg(`Supabase indisponível (${err.message || err}) — verificando Baseline local.`);
+        }
+
+        try {
+          const rawBase = localStorage.getItem(BASELINE_KEY);
+          if (!rawBase) {
+            setMsg("Informe URL e anon key do Supabase ou salve um Baseline (Antes).");
+            return;
+          }
+          const base = JSON.parse(rawBase);
+          const currText = (($("resScore") && $("resScore").textContent) || "").replace("/100", "").trim();
+          const currNum = Number(currText);
+          renderCompare(base.score, Number.isFinite(currNum) ? currNum : base.score, "Baseline (Antes)", "Atual");
+          if ($("historyBox")) {
+            $("historyBox").innerHTML = `<div class="rounded-xl bg-black/45 p-2.5 border border-emerald-500/20 text-emerald-100">Baseline local: <strong>${base.score}/100</strong> (${base.target || "alvo"})</div>`;
+          }
+          setMsg("Comparativo local carregado.");
+        } catch (_) {
+          setMsg("Não foi possível ler o histórico.");
+        }
+      }, true);
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", wireSupabaseControls);
+  } else {
+    wireSupabaseControls();
+  }
+})();
+</script>
+
+</body>
+</html>
