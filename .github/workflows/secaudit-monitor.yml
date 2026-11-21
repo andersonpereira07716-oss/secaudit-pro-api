@@ -1,0 +1,43 @@
+name: SecAudit PRO v3.1 Monitor
+
+on:
+  schedule:
+    - cron: "0 12 1,15 * *"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run SecAudit Cron Alerts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_TABLE: ${{ vars.SUPABASE_TABLE || 'audits' }}
+          CHECK_WEB_URL: ${{ vars.CHECK_WEB_URL || 'https://auditoria-seguranca-mvp.vercel.app/api/check-web' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SECAUDIT_DOMAINS_JSON: ${{ secrets.SECAUDIT_DOMAINS_JSON }}
+        run: |
+          if [ -n "$SECAUDIT_DOMAINS_JSON" ]; then
+            printf '%s
+' "$SECAUDIT_DOMAINS_JSON" > "$HOME/secaudit_monitored_domains.json"
+          elif [ -f "secaudit_monitored_domains.json" ]; then
+            cp "secaudit_monitored_domains.json" "$HOME/secaudit_monitored_domains.json"
+          fi
+          if [ -f "$HOME/secaudit_cron_alerts.py" ]; then
+            python3 "$HOME/secaudit_cron_alerts.py"
+          elif [ -f "secaudit_cron_alerts.py" ]; then
+            python3 "secaudit_cron_alerts.py"
+          else
+            echo "secaudit_cron_alerts.py não encontrado no workspace" >&2
+            exit 1
+          fi
