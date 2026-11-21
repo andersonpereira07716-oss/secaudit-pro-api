@@ -3,7 +3,7 @@ name: SecAudit PRO v3.1 Monitor
 on:
   schedule:
     - cron: "0 12 1,15 * *"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   audit:
@@ -28,8 +28,7 @@ jobs:
           SECAUDIT_DOMAINS_JSON: ${{ secrets.SECAUDIT_DOMAINS_JSON }}
         run: |
           if [ -n "$SECAUDIT_DOMAINS_JSON" ]; then
-            printf '%s
-' "$SECAUDIT_DOMAINS_JSON" > "$HOME/secaudit_monitored_domains.json"
+            printf '%s\n' "$SECAUDIT_DOMAINS_JSON" > "$HOME/secaudit_monitored_domains.json"
           elif [ -f "secaudit_monitored_domains.json" ]; then
             cp "secaudit_monitored_domains.json" "$HOME/secaudit_monitored_domains.json"
           fi
