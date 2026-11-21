@@ -98,7 +98,6 @@ def _query_udp_dns_full(host: str, rtype: str, server: str = "1.1.1.1") -> tuple
     if not qtype:
         return [], False
     txid = (sum(ord(ch) for ch in host) + qtype) & 0xFFFF
-    # RD=1 (0x0100) + AD=1 (0x0020) -> 0x0120
     header = txid.to_bytes(2, "big") + b"\x01\x20\x00\x01\x00\x00\x00\x00\x00\x00"
     question = _encode_dns_name(host) + qtype.to_bytes(2, "big") + (1).to_bytes(2, "big")
     packet = header + question
@@ -212,7 +211,6 @@ def _dig_records(host: str, rtype: str) -> list[str]:
 def _estimate_spf_lookups(spf_records: list[str]) -> int:
     if not spf_records:
         return 0
-    # Conta mecanismos DNS lookup (include:, a, mx, ptr, exists:, redirect=)
     joined = " ".join(spf_records).lower()
     lookups = 0
     for token in joined.split():
@@ -478,7 +476,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
     dns_findings: list[dict] = []
     passed_checks: list[str] = []
 
-    # 1. TLS / SSL
     tls_info = _check_tls(host, port if port != 80 else 443)
     if tls_info.get("tls_valid"):
         passed_checks.append(f"Certificado TLS valido ({tls_info.get('protocol')})")
@@ -521,7 +518,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             "action": "Configure redirecionamento 301 de HTTP para HTTPS no servidor ou CDN.",
         })
 
-    # 2. HTTP Headers & Cookies
     try:
         http_status, headers, cookies = _fetch_target_headers(target_url)
     except Exception as exc:
@@ -542,7 +538,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
                 "action": action,
             })
 
-    # Qualidade do HSTS
     hsts_val = headers.get("strict-transport-security", "")
     hsts_meta = {"present": bool(hsts_val), "max_age": None, "include_subdomains": False, "preload": False}
     if hsts_val:
@@ -563,7 +558,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             else:
                 passed_checks.append("HSTS configurado com max-age robusto")
 
-    # Analise profunda do CSP
     csp_val = headers.get("content-security-policy", "")
     csp_analysis = {
         "present": bool(csp_val),
@@ -614,7 +608,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
             csp_analysis["has_frame_ancestors"] = True
             passed_checks.append("CSP define frame-ancestors contra clickjacking")
 
-    # Headers modernos de isolamento cross-origin (COOP / CORP)
     coop_val = (headers.get("cross-origin-opener-policy") or "").strip()
     corp_val = (headers.get("cross-origin-resource-policy") or "").strip()
     if coop_val:
@@ -674,7 +667,6 @@ def run_audit(payload: dict) -> tuple[int, dict]:
                 "action": f"Defina SameSite=Lax ou SameSite=Strict no cookie {c_name} contra CSRF.",
             })
 
-    # 3. DNS & Postura de E-mail (SPF lookups, DNSSEC, MTA-STS)
     dns_info = _check_dns_and_email(host)
     if dns_info.get("has_spf"):
         lookups = dns_info.get("spf_lookups", 0)
